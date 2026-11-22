@@ -3,7 +3,7 @@ use gpui::{
     ScrollEvent, Styled as _, TestAppContext, VisualTestContext, Window, div, point, px,
 };
 
-use super::{Diff, DiffState, document::fixture};
+use super::{Diff, DiffScrollAnchor, DiffSide, DiffState, document::fixture, state::DisplayRow};
 
 /// Every line changed, so the unified patch is two rows per line.
 const LINES: usize = 300;
@@ -81,4 +81,116 @@ fn the_wheel_scrolls_past_the_rows_rendered_so_far(cx: &mut TestAppContext) {
     let top = cx.update(|_, cx| state.read(cx).list().logical_scroll_top().item_ix);
     // 2000 px of wheel travel crosses far more than the first screen of rows.
     assert!(top > 40, "scrolled to row {top}");
+}
+
+fn open<'a>(
+    cx: &'a mut TestAppContext,
+    original: &str,
+    modified: &str,
+) -> (Entity<DiffState>, &'a mut VisualTestContext) {
+    cx.update(crate::init);
+    let state =
+        cx.new(|cx| DiffState::new([fixture::modified("file.txt", original, modified)], cx));
+    let (_, cx) = cx.add_window_view({
+        let state = state.clone();
+        move |_, _| Host { state }
+    });
+    for _ in 0..3 {
+        draw(cx);
+    }
+    (state, cx)
+}
+
+fn wheel(cx: &mut VisualTestContext, times: usize, delta: f32) {
+    for _ in 0..times {
+        cx.simulate_event(ScrollEvent {
+            position: point(px(100.), px(120.)),
+            delta: ScrollDelta::Pixels(point(px(0.), px(delta))),
+            ..Default::default()
+        });
+        draw(cx);
+    }
+}
+
+fn top(state: &Entity<DiffState>, cx: &mut VisualTestContext) -> gpui::ListOffset {
+    cx.update(|_, cx| state.read(cx).list().logical_scroll_top())
+}
+
+/// Reinstalls the same file, which resets the viewport, then restores `anchor`.
+fn reinstall(
+    state: &Entity<DiffState>,
+    cx: &mut VisualTestContext,
+    anchor: &DiffScrollAnchor,
+    side: DiffSide,
+) {
+    state.update(cx, |state, cx| {
+        let files = state.files().to_vec();
+        state.set_files(files, cx);
+        state.scroll_to_anchor(anchor, side, cx);
+    });
+    draw(cx);
+}
+
+#[gpui::test]
+fn an_anchor_restores_the_top_row_and_offset_after_set_files(cx: &mut TestAppContext) {
+    let (state, cx) = long_patch(cx);
+    wheel(cx, 20, -37.);
+    let before = top(&state, cx);
+    assert!(
+        before.item_ix > 0 && before.offset_in_item > px(0.),
+        "{before:?}"
+    );
+    let anchor = cx.update(|_, cx| state.read(cx).scroll_anchor()).unwrap();
+    assert_eq!(anchor.rows_above, 0);
+    for side in [DiffSide::Original, DiffSide::Modified] {
+        reinstall(&state, cx, &anchor, side);
+        assert_eq!(top(&state, cx), before, "{side:?}");
+    }
+}
+
+#[gpui::test]
+fn an_anchor_at_the_file_header_keeps_the_header_in_view(cx: &mut TestAppContext) {
+    let original = (1..=40)
+        .map(|ix| format!("line {ix}\n"))
+        .collect::<String>();
+    let modified = original.replace("line 2\n", "line 2 changed\n");
+    let (state, cx) = open(cx, &original, &modified);
+    let anchor = cx.update(|_, cx| state.read(cx).scroll_anchor()).unwrap();
+    assert_eq!((anchor.original, anchor.modified), (Some(1), Some(1)));
+    assert!(anchor.rows_above > 0, "{anchor:?}");
+    reinstall(&state, cx, &anchor, DiffSide::Modified);
+    assert_eq!(top(&state, cx).item_ix, 0);
+}
+
+#[gpui::test]
+fn an_anchor_inside_a_collapsed_range_stops_at_the_fold_row(cx: &mut TestAppContext) {
+    let original = (1..=300)
+        .map(|ix| format!("line {ix}\n"))
+        .collect::<String>();
+    let modified = original
+        .replace("line 1\n", "line 1 changed\n")
+        .replace("line 150\n", "line 150 changed\n")
+        .replace("line 300\n", "line 300 changed\n");
+    let (state, cx) = open(cx, &original, &modified);
+    // Inside the range collapsed between the first two changes.
+    let anchor = DiffScrollAnchor {
+        path: "file.txt".into(),
+        original: Some(75),
+        modified: Some(75),
+        rows_above: 0,
+        offset: px(0.),
+    };
+    let rows_before = cx.update(|_, cx| state.read(cx).list().item_count());
+    state.update(cx, |state, cx| {
+        state.scroll_to_anchor(&anchor, DiffSide::Original, cx)
+    });
+    draw(cx);
+    let (rows_after, row) = cx.update(|_, cx| {
+        let state = state.read(cx);
+        let ix = state.list().logical_scroll_top().item_ix;
+        (state.list().item_count(), state.rows().get(ix).cloned())
+    });
+    // Nothing expanded; the top row is the fold itself.
+    assert_eq!(rows_after, rows_before);
+    assert!(matches!(row, Some(DisplayRow::Fold { .. })), "{row:?}");
 }

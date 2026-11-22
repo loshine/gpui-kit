@@ -199,6 +199,24 @@ impl SelectedLines {
     }
 }
 
+/// The viewport top as source lines instead of rows, from
+/// [`DiffState::scroll_anchor`], so it survives [`DiffState::set_files`]
+/// installing a patch whose rows differ.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DiffScrollAnchor {
+    /// The [`super::DiffFile::path`] of the file at the top.
+    pub path: SharedString,
+    /// The anchored row's line on the original side, if it shows one.
+    pub original: Option<usize>,
+    /// The anchored row's line on the modified side, if it shows one.
+    pub modified: Option<usize>,
+    /// Rows without source lines, such as the file header, from the viewport
+    /// top down to the anchored row.
+    pub rows_above: usize,
+    /// How far the top row is scrolled past its own top.
+    pub offset: Pixels,
+}
+
 /// Retained focus, viewport, context expansion and selection for a
 /// [`super::Diff`] showing one or more files of a patch.
 ///
@@ -829,6 +847,70 @@ impl DiffState {
         }
     }
 
+    /// The source lines at the top of the viewport, or `None` when no file
+    /// row with source lines is at or below it.
+    pub fn scroll_anchor(&self) -> Option<DiffScrollAnchor> {
+        let top = self.list.logical_scroll_top();
+        let file = self.rows.get(top.item_ix)?.file();
+        let (ix, (original, modified)) = (top.item_ix..self.rows.len())
+            .take_while(|ix| self.rows[*ix].file() == file)
+            .find_map(|ix| Some((ix, self.row_lines(ix)?)))?;
+        Some(DiffScrollAnchor {
+            path: self.files[file].path().clone(),
+            original,
+            modified,
+            rows_above: ix - top.item_ix,
+            offset: top.offset_in_item,
+        })
+    }
+
+    /// Restores an anchor from [`Self::scroll_anchor`] by its line on `side`,
+    /// or on the other side when it has none there. Unlike
+    /// [`Self::scroll_to_line`], it never expands a file or a collapsed range:
+    /// a line inside one scrolls to its fold row. A line the patch does not
+    /// supply scrolls to the next supplied line.
+    pub fn scroll_to_anchor(
+        &mut self,
+        anchor: &DiffScrollAnchor,
+        side: DiffSide,
+        cx: &mut Context<Self>,
+    ) {
+        let line = |side: DiffSide| match side {
+            DiffSide::Original => anchor.original,
+            DiffSide::Modified => anchor.modified,
+        };
+        let other = match side {
+            DiffSide::Original => DiffSide::Modified,
+            DiffSide::Modified => DiffSide::Original,
+        };
+        let Some((side, line)) = line(side)
+            .map(|line| (side, line))
+            .or_else(|| line(other).map(|line| (other, line)))
+        else {
+            return;
+        };
+        let Some(row) = self
+            .file_ix(&anchor.path)
+            .and_then(|file| self.nearest_source_row(file, side, line))
+        else {
+            return;
+        };
+        let file = self.rows[row].file();
+        let mut item_ix = row;
+        while row - item_ix < anchor.rows_above
+            && item_ix > 0
+            && self.rows[item_ix - 1].file() == file
+            && self.row_lines(item_ix - 1).is_none()
+        {
+            item_ix -= 1;
+        }
+        self.list.scroll_to(ListOffset {
+            item_ix,
+            offset_in_item: anchor.offset,
+        });
+        cx.notify();
+    }
+
     /// Scrolls to the header of the file at `path`, a [`DiffFile::path`].
     pub fn scroll_to_file(&mut self, path: &str, cx: &mut Context<Self>) {
         let Some(item_ix) = self
@@ -1256,6 +1338,44 @@ impl DiffState {
             });
             cx.notify();
         }
+    }
+
+    /// Both sides' line numbers shown by a code or fold row; a fold row
+    /// stands for its first pair.
+    fn row_lines(&self, ix: usize) -> Option<(Option<usize>, Option<usize>)> {
+        let (file, original, modified) = match self.rows.get(ix)? {
+            DisplayRow::Code {
+                file,
+                original,
+                modified,
+                ..
+            } => (*file, *original, *modified),
+            DisplayRow::Fold { file, pairs } => {
+                let pair = self.files[*file].pairs().get(pairs.start)?;
+                (*file, pair.original(), pair.modified())
+            }
+            _ => return None,
+        };
+        let document = &self.files[file];
+        Some((
+            original.map(|ix| document.line_number(DiffSide::Original, ix)),
+            modified.map(|ix| document.line_number(DiffSide::Modified, ix)),
+        ))
+    }
+
+    /// The row showing `line` on `side`, or the next supplied line's, or the
+    /// last line's; a line inside a collapsed range maps to its fold row.
+    fn nearest_source_row(&self, file: usize, side: DiffSide, line: usize) -> Option<usize> {
+        let lines = self.files[file].lines(side);
+        let rows = self.file_rows.get(file)?;
+        let rows = match side {
+            DiffSide::Original => &rows.original,
+            DiffSide::Modified => &rows.modified,
+        };
+        let ix = lines
+            .partition_point(|source| source.line_number() < line)
+            .min(lines.len().checked_sub(1)?);
+        rows.get(ix).copied().flatten()
     }
 
     /// The source line shown by a row, looking past headers within its file.
