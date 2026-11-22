@@ -936,6 +936,51 @@ impl DiffState {
         self.move_change(false, cx);
     }
 
+    /// Moves to the next or previous changed group after or before the group
+    /// holding `from`, or the viewport top without `from`, and returns the
+    /// group's first line. Unlike [`Self::next_change`], it stops at either
+    /// end: with no group in that direction it neither scrolls nor wraps and
+    /// returns `None`.
+    pub fn step_change(
+        &mut self,
+        forward: bool,
+        from: Option<&DiffLinePosition>,
+        cx: &mut Context<Self>,
+    ) -> Option<DiffLinePosition> {
+        let groups = &self.change_rows;
+        let target = match from.and_then(|from| self.source_row(from)) {
+            Some(row) => {
+                // Groups starting at or before `row`; the last may hold it.
+                let at = groups.partition_point(|ix| *ix <= row);
+                if forward {
+                    groups.get(at).copied()
+                } else {
+                    let inside = at > 0 && self.group_holds(groups[at - 1], row);
+                    let current = if inside { at - 1 } else { at };
+                    current.checked_sub(1).and_then(|ix| groups.get(ix)).copied()
+                }
+            }
+            None => {
+                let top = self.list.logical_scroll_top().item_ix;
+                if forward {
+                    groups.get(groups.partition_point(|ix| *ix <= top)).copied()
+                } else {
+                    groups
+                        .partition_point(|ix| *ix < top)
+                        .checked_sub(1)
+                        .and_then(|ix| groups.get(ix))
+                        .copied()
+                }
+            }
+        }?;
+        self.list.scroll_to(ListOffset {
+            item_ix: target,
+            offset_in_item: px(0.),
+        });
+        cx.notify();
+        self.row_position(target)
+    }
+
     /// Reveals part or all of a collapsed unchanged range.
     pub(crate) fn expand_fold(
         &mut self,
@@ -1376,6 +1421,15 @@ impl DiffState {
             .partition_point(|source| source.line_number() < line)
             .min(lines.len().checked_sub(1)?);
         rows.get(ix).copied().flatten()
+    }
+
+    /// Whether the changed group starting at `start` runs through `row`.
+    fn group_holds(&self, start: usize, row: usize) -> bool {
+        let file = self.rows[start].file();
+        (start..=row).all(|ix| {
+            matches!(self.rows[ix], DisplayRow::Code { changed: true, .. })
+                && self.rows[ix].file() == file
+        })
     }
 
     /// The source line shown by a row, looking past headers within its file.

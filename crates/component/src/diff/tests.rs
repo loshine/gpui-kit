@@ -318,6 +318,75 @@ fn change_navigation_wraps_groups_and_unchanged_documents_stay_in_place(cx: &mut
 }
 
 #[gpui::test]
+fn stepping_through_changes_stops_at_either_end(cx: &mut TestAppContext) {
+    let state = cx.new(|cx| {
+        DiffState::new(
+            [document(
+                "head\nold first\nmiddle\nold second\nmore\nold last\ntail\n",
+                "head\nnew first\nmiddle\nmore\nnew last\nadded\ntail\n",
+            )],
+            cx,
+        )
+    });
+    let position = |side, line| DiffLinePosition::new("review.txt", side, line);
+    state.update(cx, |state, cx| {
+        state.set_mode(DiffMode::Split, cx);
+        state.set_context_lines(None, cx);
+        let top = |state: &DiffState| state.list().logical_scroll_top().item_ix;
+
+        // Without `from`, from the viewport top.
+        state.list().scroll_to(ListOffset::default());
+        let first = state.step_change(true, None, cx);
+        assert_eq!(first, Some(position(DiffSide::Modified, 2)));
+        assert_eq!(top(state), 2);
+
+        // From the middle group, a deletion only, both ways.
+        let middle = position(DiffSide::Original, 4);
+        assert_eq!(
+            state.step_change(true, Some(&middle), cx),
+            Some(position(DiffSide::Modified, 5))
+        );
+        assert_eq!(
+            state.step_change(false, Some(&middle), cx),
+            Some(position(DiffSide::Modified, 2))
+        );
+
+        // From the second line of the last group, forward stops; backward
+        // skips the group's own first line.
+        let last = position(DiffSide::Modified, 6);
+        let before = top(state);
+        assert_eq!(state.step_change(true, Some(&last), cx), None);
+        assert_eq!(top(state), before);
+        assert_eq!(
+            state.step_change(false, Some(&last), cx),
+            Some(position(DiffSide::Original, 4))
+        );
+
+        // From the first group, backward stops.
+        let first = position(DiffSide::Modified, 2);
+        assert_eq!(state.step_change(false, Some(&first), cx), None);
+
+        // From an unchanged line between groups.
+        let gap = position(DiffSide::Modified, 3);
+        assert_eq!(
+            state.step_change(false, Some(&gap), cx),
+            Some(position(DiffSide::Modified, 2))
+        );
+        assert_eq!(
+            state.step_change(true, Some(&gap), cx),
+            Some(position(DiffSide::Original, 4))
+        );
+    });
+
+    let same =
+        cx.new(|cx| DiffState::new([document("one\ntwo\nthree\n", "one\ntwo\nthree\n")], cx));
+    same.update(cx, |state, cx| {
+        assert_eq!(state.step_change(true, None, cx), None);
+        assert_eq!(state.step_change(false, None, cx), None);
+    });
+}
+
+#[gpui::test]
 fn controlled_selection_stays_silent_and_coherent_changes_notify(cx: &mut TestAppContext) {
     let state = cx.new(|cx| DiffState::new([document("old\n", "new\n")], cx));
     let events = Rc::new(RefCell::new(Vec::new()));
