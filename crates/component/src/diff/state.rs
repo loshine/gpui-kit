@@ -103,10 +103,12 @@ pub(crate) struct LayoutKey {
     mode: DiffMode,
     line_number: bool,
     marker_lane: bool,
+    divider: bool,
     soft_wrap: bool,
 }
 
 impl LayoutKey {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         rem: Pixels,
         font_size: Pixels,
@@ -114,6 +116,7 @@ impl LayoutKey {
         mode: DiffMode,
         line_number: bool,
         marker_lane: bool,
+        divider: bool,
         soft_wrap: bool,
     ) -> Self {
         Self {
@@ -123,6 +126,7 @@ impl LayoutKey {
             mode,
             line_number,
             marker_lane,
+            divider,
             soft_wrap,
         }
     }
@@ -605,6 +609,10 @@ impl DiffState {
         self.viewport
     }
     /// The width rows need to show their longest line.
+    #[cfg(test)]
+    pub(crate) fn row_height(&self) -> Option<Pixels> {
+        self.row_height
+    }
     pub(crate) fn content_width(&self) -> Pixels {
         self.content_width
     }
@@ -957,7 +965,10 @@ impl DiffState {
                 } else {
                     let inside = at > 0 && self.group_holds(groups[at - 1], row);
                     let current = if inside { at - 1 } else { at };
-                    current.checked_sub(1).and_then(|ix| groups.get(ix)).copied()
+                    current
+                        .checked_sub(1)
+                        .and_then(|ix| groups.get(ix))
+                        .copied()
                 }
             }
             None => {

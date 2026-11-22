@@ -237,6 +237,8 @@ pub struct Diff {
     decorations: Rc<Decorations>,
     gutter_markers: Rc<GutterMarkers>,
     gutter_marker_content: Option<MarkerRenderer>,
+    divider_markers: Rc<GutterMarkers>,
+    divider_marker_content: Option<MarkerRenderer>,
     on_add_annotation: Option<RangeHandler>,
     on_line_click: Option<ClickHandler>,
     on_line_hover: Option<HoverHandler>,
@@ -269,6 +271,8 @@ impl Diff {
             decorations: Rc::default(),
             gutter_markers: Rc::default(),
             gutter_marker_content: None,
+            divider_markers: Rc::default(),
+            divider_marker_content: None,
             on_add_annotation: None,
             on_line_click: None,
             on_line_hover: None,
@@ -374,6 +378,31 @@ impl Diff {
         E: IntoElement,
     {
         self.gutter_marker_content = Some(Rc::new(move |marker, window, cx| {
+            render(marker, window, cx).into_any_element()
+        }));
+        self
+    }
+    /// Supplies markers for the column between the two sides of a split view,
+    /// shown in [`DiffMode::Split`] once both markers and
+    /// [`Self::render_divider_marker`] are set; unified views ignore them.
+    ///
+    /// A marker on either side's line of a row shows in that row, so a row
+    /// that only deletes or only adds can carry one. The column holds one
+    /// marker per row; when several match, the first supplied is shown, and
+    /// the original side's line is looked up first.
+    pub fn divider_markers(mut self, markers: impl IntoIterator<Item = DiffGutterMarker>) -> Self {
+        self.divider_markers = Rc::new(GutterMarkers::new(markers));
+        self
+    }
+    /// Renders each divider marker within a column one row high and wide,
+    /// at the top of its row. Presses inside the column do not start a
+    /// selection.
+    pub fn render_divider_marker<F, E>(mut self, render: F) -> Self
+    where
+        F: Fn(&DiffGutterMarker, &mut Window, &mut App) -> E + 'static,
+        E: IntoElement,
+    {
+        self.divider_marker_content = Some(Rc::new(move |marker, window, cx| {
             render(marker, window, cx).into_any_element()
         }));
         self
@@ -527,6 +556,10 @@ fn render_diff(
     let soft_wrap = props.soft_wrap;
     let marker_lane = !props.gutter_markers.is_empty() && props.gutter_marker_content.is_some();
     let lane_width = if marker_lane { row_height } else { px(0.) };
+    let divider = mode == DiffMode::Split
+        && !props.divider_markers.is_empty()
+        && props.divider_marker_content.is_some();
+    let divider_width = if divider { row_height } else { px(0.) };
     let layout = LayoutKey::new(
         rem,
         font_size,
@@ -534,6 +567,7 @@ fn render_diff(
         mode,
         props.line_number,
         marker_lane,
+        divider,
         soft_wrap,
     );
     if state.update_layout(layout, row_height) {
@@ -547,6 +581,7 @@ fn render_diff(
                 &font_family,
                 gutter_width,
                 lane_width,
+                divider_width,
                 mode,
                 window,
                 cx,
@@ -557,7 +592,7 @@ fn render_diff(
     state.sync_annotations(&props.annotations.items);
     let content_width = state.content_width().max(state.viewport().width);
     let column_width = if mode == DiffMode::Split {
-        content_width / 2.
+        (content_width - divider_width) / 2.
     } else {
         content_width
     };
@@ -587,6 +622,9 @@ fn render_diff(
         gutter_markers: props.gutter_markers,
         gutter_marker_content: props.gutter_marker_content.filter(|_| marker_lane),
         lane_width,
+        divider_markers: props.divider_markers,
+        divider_marker_content: props.divider_marker_content.filter(|_| divider),
+        divider_width,
         on_add_annotation: props.on_add_annotation,
         on_line_click: props.on_line_click,
         on_line_hover: props.on_line_hover,
@@ -766,7 +804,14 @@ fn render_diff(
                                 px(0.)
                             } else {
                                 let painted = state.geometry().borrow().painted_width();
-                                code_width(painted, gutter_width, lane_width, rem, mode)
+                                code_width(
+                                    painted,
+                                    gutter_width,
+                                    lane_width,
+                                    divider_width,
+                                    rem,
+                                    mode,
+                                )
                             };
                             if state.record_paint(bounds.size, painted) || rehinted {
                                 cx.notify();
@@ -835,6 +880,10 @@ struct CodePresentation {
     /// Set only while the marker lane is shown.
     gutter_marker_content: Option<MarkerRenderer>,
     lane_width: Pixels,
+    divider_markers: Rc<GutterMarkers>,
+    /// Set only while the split divider column is shown.
+    divider_marker_content: Option<MarkerRenderer>,
+    divider_width: Pixels,
     on_add_annotation: Option<RangeHandler>,
     on_line_click: Option<ClickHandler>,
     on_line_hover: Option<HoverHandler>,
@@ -867,11 +916,12 @@ fn code_width(
     width: Pixels,
     gutter_width: Pixels,
     lane_width: Pixels,
+    divider_width: Pixels,
     rem: Pixels,
     mode: DiffMode,
 ) -> Pixels {
     if mode == DiffMode::Split {
-        (width + gutter_width + lane_width + rem * 2.) * 2.
+        (width + gutter_width + lane_width + rem * 2.) * 2. + divider_width
     } else {
         width + gutter_width * 2. + lane_width + rem * 2.
     }
@@ -886,6 +936,7 @@ fn measure_code_width(
     family: &SharedString,
     gutter_width: Pixels,
     lane_width: Pixels,
+    divider_width: Pixels,
     mode: DiffMode,
     window: &mut Window,
     cx: &App,
@@ -936,7 +987,14 @@ fn measure_code_width(
                 .width
         })
         .fold(px(0.), Pixels::max);
-    code_width(width, gutter_width, lane_width, window.rem_size(), mode)
+    code_width(
+        width,
+        gutter_width,
+        lane_width,
+        divider_width,
+        window.rem_size(),
+        mode,
+    )
 }
 
 fn render_row(
@@ -974,6 +1032,9 @@ fn render_row(
                         code.clone(),
                         window,
                         cx,
+                    ))
+                    .children(render_divider(
+                        *file, *original, *modified, &code, window, cx,
                     ))
                     .child(render_cell(
                         *file,
@@ -1427,6 +1488,48 @@ fn side_label(side: DiffSide) -> std::borrow::Cow<'static, str> {
     }
 }
 
+/// The column between the two sides of a split row, holding the divider
+/// marker of either side's line; `None` while the column is not shown.
+fn render_divider(
+    file: usize,
+    original: Option<usize>,
+    modified: Option<usize>,
+    code: &Rc<CodePresentation>,
+    window: &mut Window,
+    cx: &mut App,
+) -> Option<AnyElement> {
+    let render = code.divider_marker_content.clone()?;
+    let marker = [
+        (DiffSide::Original, original),
+        (DiffSide::Modified, modified),
+    ]
+    .into_iter()
+    .filter_map(|(side, ix)| ix.map(|ix| code.position(file, side, ix)))
+    .find_map(|position| code.divider_markers.at(&position).cloned());
+    Some(
+        div()
+            .id(("divider", original.or(modified).unwrap_or_default()))
+            .w(code.divider_width)
+            .flex_shrink_0()
+            .border_l_1()
+            .border_r_1()
+            .border_color(cx.theme().border)
+            // Keep presses on a marker from starting a text or line selection.
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(
+                div()
+                    .size(code.divider_width)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .when_some(marker, |this, marker| {
+                        this.child(render(&marker, window, cx))
+                    }),
+            )
+            .into_any_element(),
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_cell(
     file: usize,
@@ -1442,9 +1545,10 @@ fn render_cell(
         .w(code.column_width)
         .min_w_0()
         .flex_shrink_0()
-        .when(side == DiffSide::Original, |this| {
-            this.border_r_1().border_color(cx.theme().border)
-        })
+        .when(
+            side == DiffSide::Original && code.divider_marker_content.is_none(),
+            |this| this.border_r_1().border_color(cx.theme().border),
+        )
         .when(ix.is_none(), |this| {
             this.bg(cx.theme().muted.opacity(0.3))
                 .child(div().h(code.row_height))
@@ -1983,6 +2087,8 @@ fn has_line_ending_change(
 mod copy_tests;
 #[cfg(test)]
 mod decoration_tests;
+#[cfg(test)]
+mod divider_tests;
 #[cfg(test)]
 mod header_tests;
 #[cfg(test)]
