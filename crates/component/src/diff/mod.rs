@@ -590,11 +590,25 @@ fn render_diff(
         state.set_content_width(width);
     }
     state.sync_annotations(&props.annotations.items);
-    let content_width = state.content_width().max(state.viewport().width);
-    let column_width = if mode == DiffMode::Split {
-        (content_width - divider_width) / 2.
+    let viewport_width = state.viewport().width;
+    let measured = state.content_width().max(viewport_width);
+    // Split columns each take half the viewport and clip their code, which
+    // scrolls sideways in both columns together; the list is only as much
+    // wider than the viewport as the longer side's code overflows a column.
+    let split_scroll = mode == DiffMode::Split && !soft_wrap;
+    let (content_width, column_width) = if split_scroll {
+        (
+            viewport_width + (measured - viewport_width) / 2.,
+            ((viewport_width - divider_width) / 2.).max(px(0.)),
+        )
     } else {
-        content_width
+        (measured, measured)
+    };
+    let horizontal = state.horizontal_scroll().clone();
+    let split_shift = if split_scroll {
+        (-horizontal.offset().x).clamp(px(0.), content_width - viewport_width)
+    } else {
+        px(0.)
     };
     let code = Rc::new(CodePresentation {
         files: state.files().to_vec(),
@@ -625,6 +639,8 @@ fn render_diff(
         divider_markers: props.divider_markers,
         divider_marker_content: props.divider_marker_content.filter(|_| divider),
         divider_width,
+        split_scroll,
+        split_shift,
         on_add_annotation: props.on_add_annotation,
         on_line_click: props.on_line_click,
         on_line_hover: props.on_line_hover,
@@ -636,7 +652,6 @@ fn render_diff(
     });
     let rows = state.rows().clone();
     let scrollbar = state.list().clone();
-    let horizontal = state.horizontal_scroll().clone();
     let has_rows = !rows.is_empty();
     let label = match state.files() {
         [file] => t!("Diff.Viewer", name = file.path().as_str()).to_string(),
@@ -884,6 +899,11 @@ struct CodePresentation {
     /// Set only while the split divider column is shown.
     divider_marker_content: Option<MarkerRenderer>,
     divider_width: Pixels,
+    /// Split columns keep their place and scroll their code sideways.
+    split_scroll: bool,
+    /// How far split code is scrolled sideways, which split rows offset so
+    /// their columns stay in view.
+    split_shift: Pixels,
     on_add_annotation: Option<RangeHandler>,
     on_line_click: Option<ClickHandler>,
     on_line_hover: Option<HoverHandler>,
@@ -1023,6 +1043,9 @@ fn render_row(
                 h_flex()
                     .items_stretch()
                     .w_full()
+                    .when(code.split_scroll, |this| {
+                        this.child(div().w(code.split_shift).flex_shrink_0())
+                    })
                     .child(render_cell(
                         *file,
                         DiffSide::Original,
@@ -1938,7 +1961,7 @@ fn code_line(
         })
         .children(marker_lane)
         .child(indicator)
-        .child(
+        .child(split_clip(
             div()
                 .id("source")
                 .test_support()
@@ -1981,9 +2004,44 @@ fn code_line(
                     })
                 })
                 .child(text),
-        )
+            file,
+            side,
+            ix,
+            &code,
+        ))
         .children(add_button)
         .into_any_element()
+}
+
+/// In a split column that scrolls sideways, clips the code to the column and
+/// shifts it by the shared offset; elsewhere returns it as is.
+fn split_clip(
+    source: impl IntoElement,
+    file: usize,
+    side: DiffSide,
+    ix: usize,
+    code: &CodePresentation,
+) -> AnyElement {
+    if !code.split_scroll || code.files[file].is_single_column() {
+        return source.into_any_element();
+    }
+    let shifted = div().flex_shrink_0().ml(-code.split_shift).child(source);
+    let clip = div().flex_1().min_w_0().h_full().overflow_hidden();
+    #[cfg(test)]
+    let (shifted, clip) = {
+        let label = if side == DiffSide::Original {
+            "old"
+        } else {
+            "new"
+        };
+        (
+            shifted.debug_selector(move || format!("split-source-{label}-{ix}")),
+            clip.debug_selector(move || format!("split-code-{label}-{ix}")),
+        )
+    };
+    #[cfg(not(test))]
+    let _ = (side, ix);
+    clip.child(shifted).into_any_element()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2099,5 +2157,7 @@ mod review_tests;
 mod scroll_tests;
 #[cfg(test)]
 mod selection_tests;
+#[cfg(test)]
+mod split_tests;
 #[cfg(test)]
 mod tests;
