@@ -1,6 +1,6 @@
 use crate::TestSupportExt as _;
 use gpui::StatefulInteractiveElement as _;
-use std::{cell::RefCell, ops::Range, rc::Rc};
+use std::{cell::RefCell, collections::HashSet, ops::Range, rc::Rc};
 
 use gpui::{
     AnyElement, App, Context, ElementId, Entity, EventEmitter, FocusHandle, InteractiveElement,
@@ -193,6 +193,10 @@ pub struct TreeState {
     entries: Vec<TreeEntry>,
     scroll_handle: UniformListScrollHandle,
     selected_ix: Option<usize>,
+    /// Extra selected items by id, kept in insertion order. Stored by id so
+    /// that expanding or collapsing a folder above them does not shift them.
+    selected_ids: Vec<SharedString>,
+    selected_id_set: HashSet<SharedString>,
     right_clicked_ix: Option<usize>,
     render_item: Rc<RenderItem>,
     list_style: StyleRefinement,
@@ -207,6 +211,8 @@ impl TreeState {
             entries: Vec::new(),
             scroll_handle: UniformListScrollHandle::default(),
             selected_ix: None,
+            selected_ids: Vec::new(),
+            selected_id_set: HashSet::new(),
             right_clicked_ix: None,
             render_item: Rc::new(|_, _, _, _, _| div().into_any_element()),
             list_style: StyleRefinement::default(),
@@ -221,8 +227,58 @@ impl TreeState {
     pub fn set_items(&mut self, items: impl Into<Vec<TreeItem>>, cx: &mut Context<Self>) {
         self.replace_items(items.into());
         self.selected_ix = None;
+        self.selected_ids.clear();
+        self.selected_id_set.clear();
         self.right_clicked_ix = None;
         cx.notify();
+    }
+
+    /// The number of visible entries.
+    pub fn entries_len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// The ids selected in addition to the selected (lead) entry, in the
+    /// order they were set.
+    pub fn selected_ids(&self) -> &[SharedString] {
+        &self.selected_ids
+    }
+
+    /// Replaces the ids rendered as selected in addition to the selected
+    /// (lead) entry. Ids that are not visible are kept and render as selected
+    /// once their entry becomes visible. [`Self::set_items`] clears them.
+    pub fn set_selected_ids(
+        &mut self,
+        ids: impl IntoIterator<Item = SharedString>,
+        cx: &mut Context<Self>,
+    ) {
+        self.selected_ids.clear();
+        self.selected_id_set.clear();
+        for id in ids {
+            if self.selected_id_set.insert(id.clone()) {
+                self.selected_ids.push(id);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Clears both the selected (lead) entry and the selected ids.
+    pub fn clear_selection(&mut self, cx: &mut Context<Self>) {
+        self.selected_ix = None;
+        self.selected_ids.clear();
+        self.selected_id_set.clear();
+        cx.notify();
+    }
+
+    fn entry_state(&self, ix: usize) -> TreeEntryState {
+        TreeEntryState {
+            selected: Some(ix) == self.selected_ix
+                || self
+                    .entries
+                    .get(ix)
+                    .is_some_and(|entry| self.selected_id_set.contains(&entry.item.id)),
+            right_clicked: Some(ix) == self.right_clicked_ix,
+        }
     }
 
     pub fn selected_index(&self) -> Option<usize> {
@@ -452,11 +508,8 @@ impl Render for TreeState {
             cx.processor(move |state, visible_range: Range<usize>, window, cx| {
                 visible_range
                     .map(|ix| {
+                        let entry_state = state.entry_state(ix);
                         let entry = &state.entries[ix];
-                        let entry_state = TreeEntryState {
-                            selected: Some(ix) == state.selected_ix,
-                            right_clicked: Some(ix) == state.right_clicked_ix,
-                        };
                         div()
                             .id(ix)
                             .test_support()
@@ -815,6 +868,99 @@ mod tests {
         state.read_with(cx, |state, _| {
             assert_eq!(state.selected_index(), None);
             assert_eq!(state.entries.len(), 1);
+        });
+    }
+
+    fn selected_rows(state: &TreeState) -> Vec<&str> {
+        (0..state.entries_len())
+            .filter(|&ix| state.entry_state(ix).is_selected())
+            .map(|ix| state.entries[ix].item().id.as_str())
+            .collect()
+    }
+
+    fn two_folders() -> Vec<TreeItem> {
+        vec![
+            TreeItem::new("a", "a")
+                .expanded(true)
+                .child(TreeItem::new("a/1", "1"))
+                .child(TreeItem::new("a/2", "2")),
+            TreeItem::new("b", "b")
+                .expanded(true)
+                .child(TreeItem::new("b/1", "1"))
+                .child(TreeItem::new("b/2", "2")),
+        ]
+    }
+
+    #[gpui::test]
+    fn selected_ids_render_as_selected_with_the_lead(cx: &mut gpui::TestAppContext) {
+        let state = cx.new(|cx| TreeState::new(cx).items(two_folders()));
+
+        state.update(cx, |state, cx| {
+            state.set_selected_index(Some(1), cx);
+            state.set_selected_ids(["b/2".into(), "a/1".into(), "b/2".into()], cx);
+            assert_eq!(state.selected_ids(), ["b/2", "a/1"]);
+            assert_eq!(selected_rows(state), vec!["a/1", "b/2"]);
+            assert_eq!(
+                state.selected_item().map(|item| item.id.as_str()),
+                Some("a/1")
+            );
+
+            state.clear_selection(cx);
+            assert_eq!(state.selected_index(), None);
+            assert!(state.selected_ids().is_empty());
+            assert!(selected_rows(state).is_empty());
+        });
+    }
+
+    #[gpui::test]
+    fn selected_ids_follow_their_entries_when_a_folder_above_toggles(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let state = cx.new(|cx| TreeState::new(cx).items(two_folders()));
+
+        state.update(cx, |state, cx| {
+            state.set_selected_ids(["b/1".into(), "a/2".into()], cx);
+            state.toggle_expand(0, cx);
+            assert_eq!(selected_rows(state), vec!["b/1"]);
+            state.toggle_expand(0, cx);
+            assert_eq!(selected_rows(state), vec!["a/2", "b/1"]);
+
+            state.set_items(two_folders(), cx);
+            assert!(state.selected_ids().is_empty());
+            assert!(selected_rows(state).is_empty());
+        });
+    }
+
+    #[gpui::test]
+    fn without_selected_ids_only_the_lead_is_selected(cx: &mut gpui::TestAppContext) {
+        let state = cx.new(|cx| TreeState::new(cx).items(two_folders()));
+
+        state.update(cx, |state, cx| {
+            assert!(selected_rows(state).is_empty());
+            state.set_selected_index(Some(4), cx);
+            state.right_clicked_ix = Some(2);
+            for ix in 0..state.entries_len() {
+                assert_eq!(
+                    state.entry_state(ix),
+                    TreeEntryState {
+                        selected: ix == 4,
+                        right_clicked: ix == 2,
+                    }
+                );
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn entries_len_counts_visible_entries(cx: &mut gpui::TestAppContext) {
+        let state = cx.new(|cx| TreeState::new(cx).items(two_folders()));
+
+        state.update(cx, |state, cx| {
+            assert_eq!(state.entries_len(), 6);
+            state.toggle_expand(3, cx);
+            assert_eq!(state.entries_len(), 4);
+            state.toggle_expand(0, cx);
+            assert_eq!(state.entries_len(), 2);
         });
     }
 
