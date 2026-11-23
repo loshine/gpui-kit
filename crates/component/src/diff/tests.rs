@@ -355,6 +355,9 @@ fn stepping_through_changes_stops_at_either_end(cx: &mut TestAppContext) {
         // skips the group's own first line.
         let last = position(DiffSide::Modified, 6);
         let before = top(state);
+        assert!(!state.has_change(true, Some(&last)));
+        assert!(state.has_change(false, Some(&last)));
+        assert_eq!(top(state), before);
         assert_eq!(state.step_change(true, Some(&last), cx), None);
         assert_eq!(top(state), before);
         assert_eq!(
@@ -381,6 +384,7 @@ fn stepping_through_changes_stops_at_either_end(cx: &mut TestAppContext) {
     let same =
         cx.new(|cx| DiffState::new([document("one\ntwo\nthree\n", "one\ntwo\nthree\n")], cx));
     same.update(cx, |state, cx| {
+        assert!(!state.has_change(true, None));
         assert_eq!(state.step_change(true, None, cx), None);
         assert_eq!(state.step_change(false, None, cx), None);
     });

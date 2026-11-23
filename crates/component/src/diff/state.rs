@@ -955,8 +955,25 @@ impl DiffState {
         from: Option<&DiffLinePosition>,
         cx: &mut Context<Self>,
     ) -> Option<DiffLinePosition> {
+        let target = self.change_target(forward, from)?;
+        self.list.scroll_to(ListOffset {
+            item_ix: target,
+            offset_in_item: px(0.),
+        });
+        cx.notify();
+        self.row_position(target)
+    }
+
+    /// Whether [`Self::step_change`] with the same arguments would move, without
+    /// scrolling.
+    pub fn has_change(&self, forward: bool, from: Option<&DiffLinePosition>) -> bool {
+        self.change_target(forward, from).is_some()
+    }
+
+    /// The first row of the changed group [`Self::step_change`] moves to.
+    fn change_target(&self, forward: bool, from: Option<&DiffLinePosition>) -> Option<usize> {
         let groups = &self.change_rows;
-        let target = match from.and_then(|from| self.source_row(from)) {
+        match from.and_then(|from| self.source_row(from)) {
             Some(row) => {
                 // Groups starting at or before `row`; the last may hold it.
                 let at = groups.partition_point(|ix| *ix <= row);
@@ -983,13 +1000,7 @@ impl DiffState {
                         .copied()
                 }
             }
-        }?;
-        self.list.scroll_to(ListOffset {
-            item_ix: target,
-            offset_in_item: px(0.),
-        });
-        cx.notify();
-        self.row_position(target)
+        }
     }
 
     /// Reveals part or all of a collapsed unchanged range.
