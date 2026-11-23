@@ -508,6 +508,7 @@ impl Diff {
         self
     }
     /// Reports the line under the pointer, or `None` when the pointer leaves it.
+    /// A right press on a line reports it again, from the frame it lands on.
     pub fn on_line_hover<F>(mut self, handler: F) -> Self
     where
         F: Fn(Option<&DiffLinePosition>, &mut Window, &mut App) + 'static,
@@ -1955,8 +1956,16 @@ fn code_line(
         })
         .when_some(code.on_line_hover.clone(), |this, handler| {
             let position = position.clone();
+            let pressed = (handler.clone(), position.clone());
             this.on_hover(move |hovered, window, cx| {
                 handler(hovered.then_some(&position), window, cx)
+            })
+            // A row element is reused by its index in the patch, so after new
+            // content it can stay hovered, with no callback, while its line
+            // moves. A right press reports the line it lands on in the drawn
+            // frame before a context menu built from it opens.
+            .on_mouse_down(MouseButton::Right, move |_, window, cx| {
+                (pressed.0)(Some(&pressed.1), window, cx)
             })
         })
         // A line-number drag keeps extending while the pointer is over the code,
