@@ -597,10 +597,7 @@ fn render_diff(
     // wider than the viewport as the longer side's code overflows a column.
     let split_scroll = mode == DiffMode::Split && !soft_wrap;
     let (content_width, column_width) = if split_scroll {
-        (
-            viewport_width + (measured - viewport_width) / 2.,
-            ((viewport_width - divider_width) / 2.).max(px(0.)),
-        )
+        split_widths(viewport_width, measured, divider_width)
     } else {
         (measured, measured)
     };
@@ -2035,6 +2032,20 @@ fn code_line(
         ))
         .children(add_button)
         .into_any_element()
+}
+
+/// The list width and the width of each column for split code that scrolls
+/// sideways. Before the first paint measures the viewport, the columns split
+/// the estimated code width as they would without sideways scrolling, so the
+/// first frame does not draw them collapsed.
+fn split_widths(viewport: Pixels, measured: Pixels, divider: Pixels) -> (Pixels, Pixels) {
+    if viewport <= px(0.) {
+        return (measured, ((measured - divider) / 2.).max(px(0.)));
+    }
+    (
+        viewport + (measured - viewport) / 2.,
+        ((viewport - divider) / 2.).max(px(0.)),
+    )
 }
 
 /// In a split column that scrolls sideways, clips the code to the column and

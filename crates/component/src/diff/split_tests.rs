@@ -125,3 +125,17 @@ fn split_columns_stay_equal_when_the_window_narrows(cx: &mut TestAppContext) {
     assert_equal_columns(cx);
     assert!(bounds(cx, "split-code-old-0").size.width < wide);
 }
+
+#[test]
+fn split_columns_have_width_before_the_viewport_is_measured() {
+    // The viewport is measured only once the list has painted. Until then
+    // the columns fall back to half the estimated code width instead of
+    // half of nothing, which drew collapsed columns for one frame.
+    let (content, column) = super::split_widths(px(0.), px(800.), px(1.));
+    assert_eq!(content, px(800.));
+    assert_eq!(column, px(399.5));
+    // Once measured, the columns take half the viewport each.
+    let (content, column) = super::split_widths(px(600.), px(800.), px(1.));
+    assert_eq!(content, px(700.));
+    assert_eq!(column, px(299.5));
+}
