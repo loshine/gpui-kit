@@ -1501,6 +1501,9 @@ fn render_gutter(
                     })
                     .on_mouse_move(move |event, _, cx| {
                         if event.pressed_button == Some(MouseButton::Left) {
+                            // The row below also extends a drag; over a line number the
+                            // number's own side wins.
+                            cx.stop_propagation();
                             moved.update(cx, |state, cx| {
                                 state.drag_line_selection(dragged.clone(), cx)
                             })
@@ -1957,6 +1960,19 @@ fn code_line(
             let position = position.clone();
             this.on_hover(move |hovered, window, cx| {
                 handler(hovered.then_some(&position), window, cx)
+            })
+        })
+        // A line-number drag keeps extending while the pointer is over the code,
+        // not only over the narrow number column.
+        .when(!positions.is_empty(), |this| {
+            let state = code.state.clone();
+            let positions = positions.clone();
+            this.on_mouse_move(move |event, _, cx| {
+                if event.pressed_button == Some(MouseButton::Left) {
+                    state.update(cx, |state, cx| {
+                        state.drag_line_selection_over(&positions, cx)
+                    })
+                }
             })
         })
         .when(code.line_number, |this| {

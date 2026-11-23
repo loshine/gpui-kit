@@ -164,6 +164,41 @@ fn line_selection_reports_a_gesture_lifecycle(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn a_line_number_drag_extends_over_the_code_of_a_row(cx: &mut TestAppContext) {
+    let window = cx.open_window(size(px(640.), px(480.)), |_, _| Empty);
+    let state = cx.new(|cx| DiffState::new(DiffFile::parse(PATCH).unwrap(), cx));
+    let position = |side, line| DiffLinePosition::new("first.txt", side, line);
+    cx.update_window(window.into(), |_, window, cx| {
+        state.update(cx, |state, cx| {
+            // Without an active gesture, moving over a row selects nothing.
+            state.drag_line_selection_over(&[position(DiffSide::Modified, 3)], cx);
+            assert!(state.selected_lines().is_none());
+            state.begin_line_selection(position(DiffSide::Modified, 1), false, window, cx);
+            // An unchanged Unified row carries both sides; the anchor's side wins.
+            state.drag_line_selection_over(
+                &[
+                    position(DiffSide::Original, 3),
+                    position(DiffSide::Modified, 3),
+                ],
+                cx,
+            );
+            assert_eq!(
+                state.selected_lines(),
+                Some(DiffLineRange::new("first.txt", DiffSide::Modified, 1, 3))
+            );
+            state.end_line_selection(cx);
+            // The gesture is over: later moves no longer extend it.
+            state.drag_line_selection_over(&[position(DiffSide::Modified, 2)], cx);
+            assert_eq!(
+                state.selected_lines(),
+                Some(DiffLineRange::new("first.txt", DiffSide::Modified, 1, 3))
+            );
+        });
+    })
+    .unwrap();
+}
+
+#[gpui::test]
 fn programmatic_cross_side_ranges_clip_to_supplied_lines(cx: &mut TestAppContext) {
     let state = cx.new(|cx| DiffState::new(DiffFile::parse(PATCH).unwrap(), cx));
     state.update(cx, |state, cx| {

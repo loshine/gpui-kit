@@ -1097,6 +1097,25 @@ impl DiffState {
         self.select_user_range(anchor, position, cx);
     }
 
+    /// Extends an active line-number gesture to a row under the pointer, which
+    /// carries one position per side it shows: the anchor's side first.
+    pub(crate) fn drag_line_selection_over(
+        &mut self,
+        positions: &[DiffLinePosition],
+        cx: &mut Context<Self>,
+    ) {
+        let Some(anchor) = self.selection_anchor.as_ref().filter(|_| self.selecting) else {
+            return;
+        };
+        let target = positions
+            .iter()
+            .find(|position| position.side() == anchor.side())
+            .or_else(|| positions.first());
+        if let Some(position) = target.cloned() {
+            self.drag_line_selection(position, cx);
+        }
+    }
+
     /// Whether a selection anchored at `anchor` may extend to `position`:
     /// within one file, and across sides only in Unified mode, whose rows
     /// follow patch order.
