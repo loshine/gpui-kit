@@ -843,6 +843,29 @@ impl DiffState {
             .to_owned()
     }
 
+    /// The source lines the native text selection covers, on the side it was
+    /// made in; `None` without a text selection in this diff. A selection that
+    /// ends at the start of a line does not include that line.
+    pub fn selected_text_lines(&self, cx: &App) -> Option<DiffLineRange> {
+        let (file, side, range) = super::selection::selected_source_range(&self.selection, cx)?;
+        let document = self.files.get(file)?;
+        let lines = document.lines(side);
+        let line_at = |offset: usize| {
+            lines
+                .iter()
+                .position(|line| offset < line.source().end)
+                .or_else(|| lines.len().checked_sub(1))
+        };
+        let first = line_at(range.start)?;
+        let last = line_at(range.end.saturating_sub(1).max(range.start))?;
+        Some(DiffLineRange::new(
+            document.path().clone(),
+            side,
+            document.line_number(side, first),
+            document.line_number(side, last),
+        ))
+    }
+
     /// Reveals and scrolls to a source line, expanding its file and hidden
     /// context if needed.
     pub fn scroll_to_line(&mut self, position: DiffLinePosition, cx: &mut Context<Self>) {
