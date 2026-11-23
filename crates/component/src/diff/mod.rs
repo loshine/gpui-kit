@@ -652,6 +652,7 @@ fn render_diff(
     });
     let rows = state.rows().clone();
     let scrollbar = state.list().clone();
+    let scrolled = cx.weak_entity();
     let has_rows = !rows.is_empty();
     let label = match state.files() {
         [file] => t!("Diff.Viewer", name = file.path().as_str()).to_string(),
@@ -671,20 +672,27 @@ fn render_diff(
                 // single-axis wheel remapping. The sibling mask owns X input.
                 .when(!soft_wrap, |this| this.overflow_x_hidden())
                 .track_scroll(&horizontal)
-                .child(gpui_base::ScrollBounce::new(
-                    "diff-bounce",
-                    &scrollbar,
-                    list(scrollbar.clone(), move |ix, window, cx| {
-                        let row = &rows[ix];
-                        div()
-                            .id(("diff-file", row.file()))
-                            .w_full()
-                            .child(render_row(row, code.clone(), window, cx))
-                            .into_any_element()
-                    })
-                    .w(content_width)
-                    .h_full(),
-                ))
+                .child(
+                    gpui_base::ScrollBounce::new(
+                        "diff-bounce",
+                        &scrollbar,
+                        list(scrollbar.clone(), move |ix, window, cx| {
+                            let row = &rows[ix];
+                            div()
+                                .id(("diff-file", row.file()))
+                                .w_full()
+                                .child(render_row(row, code.clone(), window, cx))
+                                .into_any_element()
+                        })
+                        .w(content_width)
+                        .h_full(),
+                    )
+                    .on_scroll(move |_, cx| {
+                        scrolled
+                            .update(cx, |_, cx| cx.emit(DiffEvent::Scrolled))
+                            .ok();
+                    }),
+                )
                 .into_any_element(),
             scrollbar.clone(),
             horizontal.clone(),

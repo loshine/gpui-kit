@@ -92,6 +92,9 @@ pub enum DiffEvent {
     /// The user resolved a merge conflict, or undid its resolution; read it
     /// with [`DiffState::conflict_resolution`].
     ConflictResolved(SharedString, usize),
+    /// The user scrolled the rows with the wheel or trackpad. Programmatic
+    /// scrolls, such as [`DiffState::step_change`], do not report it.
+    Scrolled,
 }
 
 /// Inputs that determine row heights and content width.

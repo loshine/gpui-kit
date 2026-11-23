@@ -83,6 +83,29 @@ fn the_wheel_scrolls_past_the_rows_rendered_so_far(cx: &mut TestAppContext) {
     assert!(top > 40, "scrolled to row {top}");
 }
 
+#[gpui::test]
+fn the_wheel_reports_scrolled_but_step_change_does_not(cx: &mut TestAppContext) {
+    let (state, cx) = long_patch(cx);
+    let scrolled = std::rc::Rc::new(std::cell::Cell::new(0));
+    let _subscription = cx.update(|_, cx| {
+        let scrolled = scrolled.clone();
+        cx.subscribe(&state, move |_, event: &super::DiffEvent, _| {
+            if matches!(event, super::DiffEvent::Scrolled) {
+                scrolled.set(scrolled.get() + 1);
+            }
+        })
+    });
+    state.update(cx, |state, cx| {
+        state.step_change(true, None, cx);
+    });
+    draw(cx);
+    assert_eq!(scrolled.get(), 0);
+    let before = top(&state, cx);
+    wheel(cx, 3, -40.);
+    assert_ne!(top(&state, cx), before);
+    assert!(scrolled.get() > 0);
+}
+
 fn open<'a>(
     cx: &'a mut TestAppContext,
     original: &str,
