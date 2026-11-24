@@ -235,6 +235,7 @@ pub struct DiffState {
     /// Each path's index in `files`; the first file wins a duplicated path.
     file_ixs: HashMap<SharedString, usize>,
     mode: DiffMode,
+    one_side_files: bool,
     context_lines: Option<usize>,
     expansion_lines: usize,
     min_collapsed_lines: usize,
@@ -367,6 +368,7 @@ impl DiffState {
             file_ixs: file_ixs(&files),
             files,
             mode: DiffMode::Unified,
+            one_side_files: false,
             context_lines: Some(3),
             expansion_lines: 20,
             min_collapsed_lines: 2,
@@ -411,6 +413,15 @@ impl DiffState {
     pub fn with_mode(mut self, mode: DiffMode) -> Self {
         self.mode = mode;
         self.rebuild(true);
+        self
+    }
+
+    /// Sets whether added and deleted files show one column in every display
+    /// mode: only the side they exist on, numbered by that side, with an empty
+    /// file as one empty line. Default is `false`, where split mode shows
+    /// them beside an empty column and an empty file as a notice.
+    pub fn with_one_side_files(mut self, enabled: bool) -> Self {
+        self.one_side_files = enabled;
         self
     }
 
@@ -563,6 +574,11 @@ impl DiffState {
     pub fn mode(&self) -> DiffMode {
         self.mode
     }
+    /// Whether added and deleted files show one column; see
+    /// [`Self::with_one_side_files`].
+    pub fn one_side_files(&self) -> bool {
+        self.one_side_files
+    }
     pub fn context_lines(&self) -> Option<usize> {
         self.context_lines
     }
@@ -673,6 +689,16 @@ impl DiffState {
         self.mode = mode;
         self.rebuild_at_anchor();
         self.horizontal_scroll.set_offset(point(px(0.), px(0.)));
+        cx.notify();
+    }
+
+    /// Changes whether added and deleted files show one column; see
+    /// [`Self::with_one_side_files`].
+    pub fn set_one_side_files(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if self.one_side_files == enabled {
+            return;
+        }
+        self.one_side_files = enabled;
         cx.notify();
     }
 

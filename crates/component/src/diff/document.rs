@@ -541,6 +541,30 @@ impl DiffFile {
             DiffFileStatus::Unchanged | DiffFileStatus::Conflicted
         )
     }
+    /// The side shown in the file's only column in every display mode, or
+    /// `None` when split mode shows both sides. With `one_side_files`, an
+    /// added or deleted file shows only the side it exists on.
+    pub(crate) fn single_column_side(&self, one_side_files: bool) -> Option<DiffSide> {
+        match self.status() {
+            DiffFileStatus::Unchanged | DiffFileStatus::Conflicted => Some(DiffSide::Modified),
+            DiffFileStatus::Added if one_side_files => Some(DiffSide::Modified),
+            DiffFileStatus::Deleted if one_side_files => Some(DiffSide::Original),
+            _ => None,
+        }
+    }
+    /// The side of an empty added or deleted file shown as one empty line
+    /// with `one_side_files`, rather than as a notice.
+    pub(crate) fn empty_side(&self, one_side_files: bool) -> Option<DiffSide> {
+        if self.is_binary() || !self.pairs().is_empty() {
+            return None;
+        }
+        self.single_column_side(one_side_files).filter(|_| {
+            matches!(
+                self.status(),
+                DiffFileStatus::Added | DiffFileStatus::Deleted
+            )
+        })
+    }
     /// Merge conflicts in working-file order; slice indices identify resolutions.
     pub fn conflicts(&self) -> &[DiffConflict] {
         &self.inner.conflicts

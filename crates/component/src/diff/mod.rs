@@ -612,6 +612,7 @@ fn render_diff(
         files: state.files().to_vec(),
         presentations: state.presentations().to_vec(),
         mode,
+        one_side_files: state.one_side_files(),
         content_width,
         column_width,
         font_size,
@@ -878,6 +879,7 @@ struct CodePresentation {
     files: Vec<DiffFile>,
     presentations: Vec<Option<Arc<FilePresentation>>>,
     mode: DiffMode,
+    one_side_files: bool,
     content_width: Pixels,
     column_width: Pixels,
     font_size: Pixels,
@@ -928,6 +930,11 @@ impl CodePresentation {
             side,
             document.line_number(side, ix),
         )
+    }
+
+    /// The side shown in the file's only column, or `None` for split columns.
+    fn single_column_side(&self, file: usize) -> Option<DiffSide> {
+        self.files[file].single_column_side(self.one_side_files)
     }
 
     fn is_selected(&self, file: usize, side: DiffSide, ix: usize) -> bool {
@@ -1031,7 +1038,10 @@ fn render_row(
 ) -> AnyElement {
     match row {
         DisplayRow::File(file) => render_file_header(*file, &code, window, cx),
-        DisplayRow::Notice(file) => render_notice(&code.files[*file], cx),
+        DisplayRow::Notice(file) => match code.files[*file].empty_side(code.one_side_files) {
+            Some(side) => render_empty_line(*file, side, &code, cx),
+            None => render_notice(&code.files[*file], cx),
+        },
         DisplayRow::Hunk { file, hunk } => render_hunk_separator(*file, *hunk, &code, cx),
         DisplayRow::Fold { file, pairs } => render_fold(*file, pairs.clone(), &code, cx),
         DisplayRow::Conflict {
@@ -1045,7 +1055,7 @@ fn render_row(
             modified,
             changed,
         } => {
-            if code.mode == DiffMode::Split && !code.files[*file].is_single_column() {
+            if code.mode == DiffMode::Split && code.single_column_side(*file).is_none() {
                 h_flex()
                     .items_stretch()
                     .w_full()
@@ -1407,6 +1417,93 @@ fn file_annotations(
     annotation_elements(&ixs, code, window, cx)
 }
 
+/// An empty added or deleted file shown on its one side: a single empty
+/// line, numbered 1 and marked as added or removed, in place of a notice.
+fn render_empty_line(file: usize, side: DiffSide, code: &CodePresentation, cx: &App) -> AnyElement {
+    let status = if side == DiffSide::Original {
+        cx.theme().danger
+    } else {
+        cx.theme().success
+    };
+    let indicator =
+        match code.change_indicator {
+            DiffChangeIndicator::Signs => div().w_4().flex_shrink_0().text_color(status).child(
+                if side == DiffSide::Original {
+                    "−"
+                } else {
+                    "+"
+                },
+            ),
+            DiffChangeIndicator::Bars => div()
+                .w_4()
+                .h_full()
+                .flex_shrink_0()
+                .child(div().w(px(3.)).h_full().bg(status)),
+            DiffChangeIndicator::None => div().w_2().flex_shrink_0(),
+        };
+    let label = if side == DiffSide::Original {
+        "old"
+    } else {
+        "new"
+    };
+    h_flex()
+        .id(("empty-line", file))
+        .w_full()
+        .h(code.row_height)
+        .px_2()
+        .whitespace_nowrap()
+        .font_family(cx.theme().mono_font_family.clone())
+        .text_size(code.font_size)
+        .line_height(code.row_height)
+        .when(code.change_background, |this| this.bg(status.opacity(0.12)))
+        .when(code.line_number, |this| {
+            this.child(
+                div().flex_shrink_0().w(code.gutter_width).pr_1().child(
+                    div()
+                        .w_full()
+                        .h(code.row_height)
+                        .px_1()
+                        .flex()
+                        .items_center()
+                        .justify_end()
+                        .text_color(cx.theme().muted_foreground)
+                        .child("1"),
+                ),
+            )
+        })
+        .when(code.gutter_marker_content.is_some(), |this| {
+            this.child(div().flex_shrink_0().size(code.row_height))
+        })
+        .child(indicator)
+        .child(
+            div()
+                .id("source")
+                .test_support()
+                .role(gpui::accesskit::Role::Label)
+                .aria_label("")
+                .aria_description(
+                    t!(
+                        if side == DiffSide::Original {
+                            "Diff.RemovedLine"
+                        } else {
+                            "Diff.AddedLine"
+                        },
+                        side = side_label(side),
+                        line = 1
+                    )
+                    .to_string(),
+                ),
+        )
+        .map(|this| {
+            #[cfg(test)]
+            let this = this.debug_selector(move || format!("empty-line-{label}"));
+            #[cfg(not(test))]
+            let _ = label;
+            this
+        })
+        .into_any_element()
+}
+
 /// Summarizes a file without source rows: binary, metadata-only or empty.
 fn render_notice(file: &DiffFile, cx: &App) -> AnyElement {
     let message = if !file.has_changes() {
@@ -1468,6 +1565,19 @@ fn render_gutter(
                 div()
                     .id(("line", ix))
                     .test_support()
+                    .map(|this| {
+                        #[cfg(test)]
+                        let this = this.debug_selector({
+                            let side = if side == DiffSide::Original {
+                                "old"
+                            } else {
+                                "new"
+                            };
+                            let line = position.line();
+                            move || format!("gutter-{side}-{line}")
+                        });
+                        this
+                    })
                     .w_full()
                     .h(code.row_height)
                     .px_1()
@@ -1624,7 +1734,7 @@ fn render_unified_cell(
     cx: &mut App,
 ) -> AnyElement {
     let (original, modified) = pair;
-    let single_column = code.files[file].is_single_column();
+    let single_column = code.single_column_side(file);
     let counterpart = code.files[file].lines(side)[ix].counterpart();
     let other_ix = if side == DiffSide::Original {
         modified
@@ -1642,8 +1752,13 @@ fn render_unified_cell(
             cx,
         ));
     }
-    let gutters = if single_column {
-        [Some((DiffSide::Modified, modified)), None]
+    let gutters = if let Some(column) = single_column {
+        let ix = if column == DiffSide::Original {
+            original
+        } else {
+            modified
+        };
+        [Some((column, ix)), None]
     } else {
         [
             Some((DiffSide::Original, original)),
@@ -1651,7 +1766,7 @@ fn render_unified_cell(
         ]
     };
     v_flex()
-        .w(if single_column {
+        .w(if single_column.is_some() {
             code.content_width
         } else {
             code.column_width
@@ -1996,6 +2111,18 @@ fn code_line(
                 .id("source")
                 .test_support()
                 .map(|this| {
+                    #[cfg(test)]
+                    let this = this.debug_selector({
+                        let side = if side == DiffSide::Original {
+                            "old"
+                        } else {
+                            "new"
+                        };
+                        move || format!("source-{side}-{ix}")
+                    });
+                    this
+                })
+                .map(|this| {
                     if code.soft_wrap {
                         this.flex_1().min_w_0()
                     } else {
@@ -2066,7 +2193,7 @@ fn split_clip(
     ix: usize,
     code: &CodePresentation,
 ) -> AnyElement {
-    if !code.split_scroll || code.files[file].is_single_column() {
+    if !code.split_scroll || code.single_column_side(file).is_some() {
         return source.into_any_element();
     }
     let shifted = div().flex_shrink_0().ml(-code.split_shift).child(source);
@@ -2195,6 +2322,8 @@ mod divider_tests;
 mod header_tests;
 #[cfg(test)]
 mod newline_tests;
+#[cfg(test)]
+mod one_side_tests;
 #[cfg(test)]
 mod review_tests;
 #[cfg(test)]
