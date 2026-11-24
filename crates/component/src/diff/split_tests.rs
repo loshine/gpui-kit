@@ -139,3 +139,34 @@ fn split_columns_have_width_before_the_viewport_is_measured() {
     assert_eq!(content, px(700.));
     assert_eq!(column, px(299.5));
 }
+
+#[gpui::test]
+fn a_new_diff_asks_for_a_frame_once_the_viewport_is_measured(cx: &mut TestAppContext) {
+    // The first frame lays the columns out against the estimated code width,
+    // since the viewport is measured only once the list has painted. A notify
+    // while the window draws asks for no frame, so without one requested here
+    // the short columns stayed until something else redrew the window.
+    cx.update(crate::init);
+    let state = cx.new(|cx| {
+        DiffState::new([fixture::modified("file.txt", "a\n", "b\n")], cx).with_mode(DiffMode::Split)
+    });
+    let (_, cx) = cx.add_window_view({
+        let state = state.clone();
+        move |_, _| Host {
+            state,
+            width: px(600.),
+        }
+    });
+    cx.run_until_parked();
+
+    assert!(cx.update(|window, cx| window.simulate_next_frame(cx)) > 0);
+    cx.update(|window, cx| {
+        _ = window.draw(cx);
+    });
+    assert_equal_columns(cx);
+    // The columns now share the viewport, as wide as the window.
+    let new = bounds(cx, "split-code-new-0");
+    assert!(new.right() > px(550.), "{new:?}");
+    // Once laid out against the viewport, the diff asks for no more frames.
+    assert_eq!(cx.update(|window, cx| window.simulate_next_frame(cx)), 0);
+}
