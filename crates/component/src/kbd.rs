@@ -172,8 +172,9 @@ impl Kbd {
             "backspace" => keys.push('⌫'),
             #[cfg(not(target_os = "macos"))]
             "backspace" => keys.push_str("Backspace"),
+            // On macOS, ⌦ is forward delete and ⌫ is backspace.
             #[cfg(target_os = "macos")]
-            "delete" => keys.push('⌫'),
+            "delete" => keys.push('⌦'),
             #[cfg(not(target_os = "macos"))]
             "delete" => keys.push_str("Delete"),
             #[cfg(target_os = "macos")]
@@ -296,7 +297,7 @@ mod tests {
             );
             assert_eq!(
                 Kbd::format(&Keystroke::parse("shift-delete").unwrap()),
-                "⇧⌫"
+                "⇧⌦"
             );
             assert_eq!(
                 Kbd::format(&Keystroke::parse("cmd-ctrl-shift-a").unwrap()),
