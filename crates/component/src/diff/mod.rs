@@ -815,6 +815,10 @@ fn render_diff(
             gpui::canvas(
                 {
                     let state = cx.entity();
+                    // The view the diff is drawn in. A dock draws its panels as
+                    // cached views, which are drawn again from the last frame
+                    // unless the view itself is notified.
+                    let view = window.current_view();
                     move |bounds, window, cx| {
                         let changed = state.update(cx, |state, _| {
                             // Runs after the list's prepaint, which drops
@@ -842,8 +846,7 @@ fn render_diff(
                         // columns it laid out before the viewport was measured
                         // until something else redraws the window.
                         if changed {
-                            let state = state.entity_id();
-                            window.on_next_frame(move |_, cx| cx.notify(state));
+                            window.on_next_frame(move |_, cx| cx.notify(view));
                         }
                     }
                 },

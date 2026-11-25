@@ -170,3 +170,56 @@ fn a_new_diff_asks_for_a_frame_once_the_viewport_is_measured(cx: &mut TestAppCon
     // Once laid out against the viewport, the diff asks for no more frames.
     assert_eq!(cx.update(|window, cx| window.simulate_next_frame(cx)), 0);
 }
+
+/// Draws its panel as a cached view, as a dock draws its panels. The diff is
+/// drawn in a view nested in the panel.
+struct CachedHost {
+    panel: Entity<Panel>,
+}
+
+impl Render for CachedHost {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div().size_full().child(
+            gpui::AnyView::from(self.panel.clone())
+                .cached(gpui::StyleRefinement::default().size_full()),
+        )
+    }
+}
+
+struct Panel {
+    host: Entity<Host>,
+}
+
+impl Render for Panel {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div().size_full().child(self.host.clone())
+    }
+}
+
+#[gpui::test]
+fn a_new_diff_in_a_cached_view_lays_out_against_the_viewport(cx: &mut TestAppContext) {
+    // A cached view is drawn again from the last frame unless something it
+    // read was notified, so the frame asked for once the viewport is measured
+    // has to tell the view the diff is drawn in, not only the diff's state.
+    cx.update(crate::init);
+    let state = cx.new(|cx| {
+        DiffState::new([fixture::modified("file.txt", "a\n", "b\n")], cx).with_mode(DiffMode::Split)
+    });
+    let host = cx.new(|_| Host {
+        state: state.clone(),
+        width: px(600.),
+    });
+    let panel = cx.new(|_| Panel { host });
+    let (_, cx) = cx.add_window_view(move |_, _| CachedHost { panel });
+    cx.run_until_parked();
+    for _ in 0..3 {
+        cx.update(|window, cx| {
+            window.simulate_next_frame(cx);
+            _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+    }
+    assert_equal_columns(cx);
+    let new = bounds(cx, "split-code-new-0");
+    assert!(new.right() > px(550.), "{new:?}");
+}
