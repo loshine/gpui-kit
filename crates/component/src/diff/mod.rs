@@ -1367,18 +1367,36 @@ fn fold_preview(
             })
             .collect::<Vec<_>>();
         let font_family = cx.theme().mono_font_family.clone();
+        let columns = sides.len();
         Tooltip::element(move |_, cx| {
             let muted = cx.theme().muted_foreground;
-            v_flex()
+            // One column per side's numbers, right-aligned to the widest,
+            // then the text, so every line starts at the same place.
+            h_flex()
+                .items_start()
+                .gap_3()
                 .max_h(max_height)
                 .overflow_hidden()
                 .font_family(font_family.clone())
                 .text_size(font_size)
                 .line_height(row_height)
-                .children(lines.iter().map(|(numbers, text, line)| {
+                .whitespace_nowrap()
+                .children((0..columns).map(|column| {
+                    v_flex()
+                        .flex_shrink_0()
+                        .items_end()
+                        .text_color(muted)
+                        .children(lines.iter().map(|(numbers, _, _)| {
+                            div()
+                                .h(row_height)
+                                .flex_shrink_0()
+                                .children(numbers[column].clone())
+                        }))
+                }))
+                .child(v_flex().children(lines.iter().map(|(_, text, line)| {
                     #[cfg(not(test))]
                     let _ = line;
-                    h_flex()
+                    div()
                         .map(|this| {
                             #[cfg(test)]
                             let this = {
@@ -1391,47 +1409,40 @@ fn fold_preview(
                         })
                         .h(row_height)
                         .flex_shrink_0()
-                        .gap_3()
-                        .whitespace_nowrap()
-                        .children(numbers.iter().map(|number| {
-                            div()
-                                .flex_shrink_0()
-                                .text_color(muted)
-                                .children(number.clone())
-                        }))
                         .children(text.clone())
-                }))
+                })))
         })
         .build(window, cx)
     }
 }
 
-/// A zigzag line through the middle of its parent, its phase fixed to the
-/// window so lines in neighboring elements join.
+/// A wavy line through the middle of its parent, its phase fixed to the
+/// window so lines in neighboring elements of the same row join. Each half
+/// wave is a quadratic curve; the curves meet the middle with equal slopes,
+/// so the line reads as one smooth wave.
 fn wave(color: Hsla) -> impl IntoElement {
-    const PERIOD: f32 = 8.;
-    const AMPLITUDE: f32 = 2.;
     gpui::canvas(
         |_, _, _| {},
         move |bounds, _, window, _| {
+            // In proportion to the row, as IDEA draws it.
+            let height = f32::from(bounds.size.height);
+            let half = (height * 0.375).max(3.);
+            let amplitude = (height * 0.12).max(1.5);
             let middle = bounds.center().y;
             let left = f32::from(bounds.left());
             let right = f32::from(bounds.right());
-            let mut x = (left / PERIOD).floor() * PERIOD;
+            let mut ix = (left / half).floor() as i64;
             let mut builder = gpui::PathBuilder::stroke(px(1.));
-            let at = |x: f32| {
-                let phase = (x / PERIOD).rem_euclid(1.);
-                let offset = if phase < 0.5 {
-                    AMPLITUDE - 4. * AMPLITUDE * phase
-                } else {
-                    -3. * AMPLITUDE + 4. * AMPLITUDE * phase
-                };
-                point(px(x), middle + px(offset))
-            };
-            builder.move_to(at(x));
-            while x < right {
-                x += PERIOD / 2.;
-                builder.line_to(at(x));
+            builder.move_to(point(px(ix as f32 * half), middle));
+            while (ix as f32) * half < right {
+                let x = ix as f32 * half;
+                // Twice the amplitude puts the curve's peak at the amplitude.
+                let peak = if ix.rem_euclid(2) == 0 { -2. } else { 2. } * amplitude;
+                builder.curve_to(
+                    point(px(x + half), middle),
+                    point(px(x + half / 2.), middle + px(peak)),
+                );
+                ix += 1;
             }
             window.with_content_mask(Some(gpui::ContentMask { bounds }), |window| {
                 if let Ok(path) = builder.build() {

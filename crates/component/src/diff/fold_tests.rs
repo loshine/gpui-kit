@@ -433,6 +433,13 @@ mod rendered {
             );
         }
         assert!(cx.debug_bounds("fold-preview-line-5").is_none());
+        // Two-digit numbers do not push their text further right.
+        let left = |cx: &mut VisualTestContext, line: usize| {
+            cx.debug_bounds(format!("fold-preview-line-{line}").leak())
+                .unwrap()
+                .left()
+        };
+        assert_eq!(left(cx, 6), left(cx, 13));
     }
 
     #[gpui::test]
