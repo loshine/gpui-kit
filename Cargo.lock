@@ -3940,6 +3940,7 @@ dependencies = [
  "tree-sitter-yaml",
  "tree-sitter-zig",
  "two-face",
+ "unicode-properties",
  "unicode-segmentation",
  "unicode-width",
  "uuid",

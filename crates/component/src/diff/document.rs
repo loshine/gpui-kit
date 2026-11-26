@@ -4,6 +4,7 @@ use gpui::SharedString;
 
 use super::conflict::DiffConflict;
 use super::parser::{DiffParseError, DiffParseOptions};
+use super::special_chars;
 use smallvec::{SmallVec, smallvec};
 use unicode_segmentation::UnicodeSegmentation as _;
 
@@ -126,9 +127,9 @@ pub(crate) struct SourceLine {
     display: SharedString,
     chunks: SmallVec<[DisplayChunk; 1]>,
     counterpart: Option<usize>,
-    // Only expanded tabs need an entry; ordinary UTF-8 bytes map by identity
-    // plus the cumulative expansion of earlier tabs.
-    display_tabs: Vec<DisplayTab>,
+    // Only expanded characters need an entry; ordinary UTF-8 bytes map by
+    // identity plus the cumulative expansion of earlier entries.
+    expansions: Vec<DisplayExpansion>,
     source: Range<usize>,
     content_end: usize,
 }
@@ -139,11 +140,31 @@ struct DisplayChunk {
     text: SharedString,
 }
 
+/// One source character painted as something wider than itself.
 #[derive(Clone, Debug)]
-struct DisplayTab {
+struct DisplayExpansion {
     source_offset: usize,
+    source_len: usize,
     display_offset: usize,
     width: usize,
+    kind: ExpansionKind,
+}
+
+impl DisplayExpansion {
+    fn source_end(&self) -> usize {
+        self.source_offset + self.source_len
+    }
+    fn display_end(&self) -> usize {
+        self.display_offset + self.width
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExpansionKind {
+    /// Spaces up to the next tab stop.
+    Tab,
+    /// The boxed abbreviation of an invisible or control character.
+    Special,
 }
 
 impl SourceLine {
@@ -195,34 +216,66 @@ impl SourceLine {
             .map_or_else(SharedString::default, SharedString::from)
     }
 
+    /// The source offset a display offset falls on. Inside a tab it is the
+    /// tab's start; inside an abbreviation the left half is before the
+    /// character and the right half after it, as a click divides a glyph.
     pub(crate) fn source_offset(&self, display_offset: usize) -> usize {
         let display_offset = display_offset.min(self.display.len());
         let preceding = self
-            .display_tabs
-            .partition_point(|tab| tab.display_offset <= display_offset);
-        let Some(tab) = preceding.checked_sub(1).map(|ix| &self.display_tabs[ix]) else {
+            .expansions
+            .partition_point(|expansion| expansion.display_offset <= display_offset);
+        let Some(expansion) = preceding.checked_sub(1).map(|ix| &self.expansions[ix]) else {
             return display_offset;
         };
-        if display_offset < tab.display_offset + tab.width {
-            tab.source_offset
+        if display_offset < expansion.display_end() {
+            let into = display_offset - expansion.display_offset;
+            if expansion.kind == ExpansionKind::Special && into * 2 >= expansion.width {
+                expansion.source_end()
+            } else {
+                expansion.source_offset
+            }
         } else {
-            display_offset - (tab.display_offset + tab.width - tab.source_offset - 1)
+            display_offset - expansion.display_end() + expansion.source_end()
         }
     }
     pub(crate) fn display_range(&self, source: Range<usize>) -> Range<usize> {
         self.display_offset(source.start)..self.display_offset(source.end)
     }
 
+    /// Display ranges of the boxed abbreviations within `range`.
+    pub(crate) fn special_ranges(
+        &self,
+        range: Range<usize>,
+    ) -> impl Iterator<Item = Range<usize>> + '_ {
+        self.expansions
+            .iter()
+            .filter(|expansion| expansion.kind == ExpansionKind::Special)
+            .map(|expansion| expansion.display_offset..expansion.display_end())
+            .filter(move |special| special.start < range.end && range.start < special.end)
+    }
+
     fn display_offset(&self, source_offset: usize) -> usize {
         let source_offset = source_offset.min(self.text.len());
         let preceding = self
-            .display_tabs
-            .partition_point(|tab| tab.source_offset < source_offset);
-        let expansion = preceding.checked_sub(1).map_or(0, |ix| {
-            let tab = &self.display_tabs[ix];
-            tab.display_offset + tab.width - tab.source_offset - 1
-        });
-        source_offset + expansion
+            .expansions
+            .partition_point(|expansion| expansion.source_offset < source_offset);
+        let Some(expansion) = preceding.checked_sub(1).map(|ix| &self.expansions[ix]) else {
+            return source_offset;
+        };
+        if source_offset < expansion.source_end() {
+            // Inside a multi-byte character: the whole abbreviation precedes.
+            expansion.display_end()
+        } else {
+            source_offset - expansion.source_end() + expansion.display_end()
+        }
+    }
+
+    /// Rebuilds the display form, marking invisible and control characters
+    /// when `special` is set.
+    pub(crate) fn redisplayed(&self, source: &str, special: bool) -> Self {
+        let mut line = source_line_with(source, self.source.clone(), self.line_number, special);
+        line.counterpart = self.counterpart;
+        line
     }
 }
 
@@ -479,6 +532,26 @@ impl DiffFile {
         self.language = Some(language.into());
         self
     }
+    /// Shows invisible and control characters, such as NUL, ESC, a no-break
+    /// space or a zero-width joiner, as their boxed Unicode abbreviation, the
+    /// way IntelliJ IDEA's editor does. Tab, line feed and carriage return are
+    /// not marked, nor a space carrying a combining mark or a joiner shaping
+    /// non-ASCII text.
+    ///
+    /// An abbreviation is one character for selection; copied text keeps the
+    /// original character. Without this call such characters paint as the
+    /// font draws them, usually with no width.
+    pub fn with_special_characters(mut self) -> Self {
+        let inner = Arc::make_mut(&mut self.inner);
+        for side in [&mut inner.original, &mut inner.modified] {
+            let source = side.source.clone();
+            for line in &mut side.lines {
+                *line = line.redisplayed(&source, true);
+            }
+        }
+        self
+    }
+
     /// Shows each of `sides` as a whole document, the way an editor does: a
     /// side whose source is empty or ends with a line break gets one more,
     /// empty line after its last line, numbered one past it.
@@ -840,38 +913,74 @@ fn patch_order(
 
 /// Builds the display form of one source line from its range in `source`.
 fn source_line(source: &str, range: Range<usize>, line_number: usize) -> SourceLine {
+    source_line_with(source, range, line_number, false)
+}
+
+/// Builds the display form of one source line. Tabs expand to the next
+/// four-column stop; with `special`, invisible and control characters show
+/// as their abbreviation, counted by its width for later tab stops.
+fn source_line_with(
+    source: &str,
+    range: Range<usize>,
+    line_number: usize,
+    special: bool,
+) -> SourceLine {
     let raw = &source[range.clone()];
     let content = match raw.strip_suffix('\n') {
         Some(content) => content.strip_suffix('\r').unwrap_or(content),
         None => raw,
     };
     let text = SharedString::from(content.to_owned());
-    let (display, display_tabs): (SharedString, Vec<DisplayTab>) = if content.contains('\t') {
+    let expands = content.contains('\t')
+        || special
+            && content
+                .chars()
+                .any(|ch| special_chars::abbreviation(ch).is_some());
+    let (display, expansions): (SharedString, Vec<DisplayExpansion>) = if expands {
         let mut display = String::with_capacity(content.len());
-        let mut display_tabs = Vec::new();
+        let mut expansions = Vec::new();
         let mut column = 0;
-        for (ix, ch) in content.char_indices() {
+        let mut previous = None;
+        let mut chars = content.char_indices().peekable();
+        while let Some((ix, ch)) = chars.next() {
+            let next = chars.peek().map(|(_, next)| *next);
+            let abbreviation = special
+                .then(|| special_chars::abbreviation_in(ch, previous, next))
+                .flatten();
             if ch == '\t' {
                 let spaces = 4 - column % 4;
-                display_tabs.push(DisplayTab {
+                expansions.push(DisplayExpansion {
                     source_offset: ix,
+                    source_len: 1,
                     display_offset: display.len(),
                     width: spaces,
+                    kind: ExpansionKind::Tab,
                 });
                 for _ in 0..spaces {
                     display.push(' ');
                 }
                 column += spaces;
+            } else if let Some(abbreviation) = abbreviation {
+                expansions.push(DisplayExpansion {
+                    source_offset: ix,
+                    source_len: ch.len_utf8(),
+                    display_offset: display.len(),
+                    width: abbreviation.len(),
+                    kind: ExpansionKind::Special,
+                });
+                display.push_str(abbreviation);
+                column += abbreviation.len();
             } else {
                 display.push(ch);
                 column += 1;
             }
+            previous = Some(ch);
         }
-        (display.into(), display_tabs)
+        (display.into(), expansions)
     } else {
         (text.clone(), Vec::new())
     };
-    let chunks = display_chunks(&display)
+    let chunks = whole_abbreviations(display_chunks(&display), &expansions)
         .into_iter()
         .map(|range| {
             let text = if range.start == 0 && range.end == display.len() {
@@ -888,10 +997,43 @@ fn source_line(source: &str, range: Range<usize>, line_number: usize) -> SourceL
         display,
         chunks,
         counterpart: None,
-        display_tabs,
+        expansions,
         content_end: range.start + content.len(),
         source: range,
     }
+}
+
+/// Moves chunk boundaries that fall inside an abbreviation to its start, so
+/// each box is painted by one text run.
+fn whole_abbreviations(
+    chunks: SmallVec<[Range<usize>; 1]>,
+    expansions: &[DisplayExpansion],
+) -> SmallVec<[Range<usize>; 1]> {
+    if chunks.len() < 2 || !expansions.iter().any(|e| e.kind == ExpansionKind::Special) {
+        return chunks;
+    }
+    let mut ends: SmallVec<[usize; 1]> = chunks
+        .iter()
+        .map(|chunk| {
+            expansions
+                .iter()
+                .find(|e| {
+                    e.kind == ExpansionKind::Special
+                        && e.display_offset < chunk.end
+                        && chunk.end < e.display_end()
+                })
+                .map_or(chunk.end, |e| e.display_offset)
+        })
+        .collect();
+    ends.dedup();
+    let mut start = 0;
+    ends.into_iter()
+        .filter_map(|end| {
+            let range = start..end;
+            start = end;
+            (!range.is_empty()).then_some(range)
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1140,6 +1282,130 @@ mod tests {
     }
 
     #[test]
+    fn special_characters_show_their_abbreviation() {
+        let source = "a\0b\tc\u{85}d\n";
+        let line = source_line_with(source, 0..source.len(), 1, true);
+        assert_eq!(line.text.as_str(), "a\0b\tc\u{85}d");
+        // The tab stop counts the abbreviation's width: `aNULb` ends at column 5.
+        assert_eq!(line.display.as_str(), "aNULb   cNELd");
+        assert_eq!(line.display_range(1..2), 1..4);
+        assert_eq!(line.display_range(3..4), 5..8);
+        assert_eq!(line.display_range(5..7), 9..12);
+        assert_eq!(line.display_range(7..8), 12..13);
+        // Inside the two bytes of U+0085, the whole abbreviation precedes.
+        assert_eq!(line.display_range(6..6), 12..12);
+        // The left half of an abbreviation is before its character, the
+        // right half after it; a tab maps to its start throughout.
+        for (display_offset, source_offset) in [
+            (0, 0),
+            (1, 1),
+            (2, 1),
+            (3, 2),
+            (4, 2),
+            (5, 3),
+            (7, 3),
+            (8, 4),
+            (9, 5),
+            (10, 5),
+            (11, 7),
+            (12, 7),
+            (13, 8),
+        ] {
+            assert_eq!(
+                line.source_offset(display_offset),
+                source_offset,
+                "{display_offset}"
+            );
+        }
+        assert_eq!(
+            line.special_ranges(0..line.display.len())
+                .collect::<Vec<_>>(),
+            [1..4, 9..12]
+        );
+        assert_eq!(line.special_ranges(4..9).count(), 0);
+        assert_eq!(
+            line.special_ranges(3..10).collect::<Vec<_>>(),
+            [1..4, 9..12]
+        );
+
+        // A two-letter abbreviation splits at its middle.
+        let backspace = source_line_with("x\u{8}y", 0..3, 1, true);
+        assert_eq!(backspace.display.as_str(), "xBSy");
+        assert_eq!(backspace.source_offset(2), 2);
+
+        // Without the request the characters are kept as they are.
+        let plain = source_line(source, 0..source.len(), 1);
+        assert_eq!(plain.display.as_str(), "a\0b c\u{85}d");
+        assert!(
+            plain
+                .special_ranges(0..plain.display.len())
+                .next()
+                .is_none()
+        );
+
+        // Shaping characters and characters outside the table stay as text.
+        for text in [
+            "e\u{A0}\u{301}",
+            "\u{1F469}\u{200D}\u{1F4BB}",
+            "a\u{80}b",
+            "a\rb",
+        ] {
+            let line = source_line_with(text, 0..text.len(), 1, true);
+            assert_eq!(line.display.as_str(), text);
+            assert!(line.expansions.is_empty());
+        }
+        let joiner = source_line_with("a\u{200D}b", 0..5, 1, true);
+        assert_eq!(joiner.display.as_str(), "aZWJb");
+    }
+
+    #[test]
+    fn display_chunks_keep_each_abbreviation_whole() {
+        for split in 505..515 {
+            let text = format!("{}\0{}", "a".repeat(split), "b".repeat(600));
+            let line = source_line_with(&text, 0..text.len(), 1, true);
+            let nul = split..split + 3;
+            assert_eq!(&line.display[nul.clone()], "NUL");
+            let mut end = 0;
+            for range in line.chunk_ranges() {
+                assert_eq!(range.start, end);
+                assert!(!range.is_empty());
+                assert!(
+                    !(nul.start < range.end && range.end < nul.end),
+                    "{split}: {range:?}"
+                );
+                end = range.end;
+            }
+            assert_eq!(end, line.display.len());
+        }
+    }
+
+    #[test]
+    fn a_file_shows_special_characters_on_request() {
+        let document = fixture::modified(
+            "nul.txt",
+            "line one\nline\0two\n",
+            "line one\nline\0two changed\n",
+        );
+        assert_eq!(
+            document.lines(DiffSide::Modified)[1].display().as_str(),
+            "line\0two changed"
+        );
+        let marked = document.clone().with_special_characters();
+        for side in [DiffSide::Original, DiffSide::Modified] {
+            let line = &marked.lines(side)[1];
+            assert!(line.display().starts_with("lineNULtwo"));
+            assert_eq!(line.text().as_str(), &document.lines(side)[1].text()[..]);
+            assert_eq!(line.counterpart(), document.lines(side)[1].counterpart());
+        }
+        // Copying reads the source, not the abbreviation.
+        assert_eq!(
+            marked.text_for_lines(DiffSide::Modified, 2, 2),
+            "line\0two changed\n"
+        );
+        assert_eq!(marked.pairs(), document.pairs());
+    }
+
+    #[test]
     fn source_display_mapping_preserves_tabs_and_unicode() {
         let lines = source_lines("é\t中\t\r\nlast\r");
         let first = &lines[0];
@@ -1147,7 +1413,7 @@ mod tests {
         assert_eq!(first.display.as_str(), "é   中   ");
         assert_eq!(first.source, 0..9);
         assert_eq!(first.content_end, 7);
-        assert_eq!(first.display_tabs.len(), 2);
+        assert_eq!(first.expansions.len(), 2);
         assert_eq!(first.display_range(2..3), 2..5);
         assert_eq!(first.display_range(6..7), 8..11);
         assert_eq!(
@@ -1161,12 +1427,12 @@ mod tests {
         assert_eq!(first.source_offset(first.display.len()), first.text.len());
         assert_eq!(first.source_offset(usize::MAX), first.text.len());
         assert_eq!(lines[1].text.as_str(), "last\r");
-        assert!(lines[1].display_tabs.is_empty());
+        assert!(lines[1].expansions.is_empty());
         assert_eq!(lines[1].source_offset(2), 2);
         assert_eq!(lines[1].source_offset(usize::MAX), lines[1].text.len());
         assert_eq!(lines[1].display_range(1..4), 1..4);
         let plain_unicode = source_lines("中é");
-        assert!(plain_unicode[0].display_tabs.is_empty());
+        assert!(plain_unicode[0].expansions.is_empty());
         assert_eq!(plain_unicode[0].display_range(3..5), 3..5);
         assert_eq!(plain_unicode[0].source_offset(3), 3);
         assert!(source_lines("").is_empty());
@@ -1186,7 +1452,7 @@ mod tests {
         }
         let adjacent_tabs = source_lines("\t\té\t");
         assert_eq!(adjacent_tabs[0].display.as_str(), "        é   ");
-        assert_eq!(adjacent_tabs[0].display_tabs.len(), 3);
+        assert_eq!(adjacent_tabs[0].expansions.len(), 3);
         for (source_offset, display_offset) in [0, 4, 8, 9, 10, 13].into_iter().enumerate() {
             assert_eq!(
                 adjacent_tabs[0].display_range(source_offset..source_offset),
@@ -1196,7 +1462,7 @@ mod tests {
         let long_line = source_lines("a long source line without tabs uses shared heap storage");
         assert_eq!(long_line[0].text.as_ptr(), long_line[0].display.as_ptr());
         let long_tab_line = source_lines(&format!("{}\t", "a".repeat(100_000)));
-        assert_eq!(long_tab_line[0].display_tabs.len(), 1);
+        assert_eq!(long_tab_line[0].expansions.len(), 1);
     }
 
     #[test]

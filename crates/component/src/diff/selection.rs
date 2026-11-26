@@ -12,7 +12,7 @@ use gpui::{
     AnyElement, App, Bounds, Element, ElementId, GlobalElementId, HighlightStyle, Hitbox,
     HitboxBehavior, InspectorElementId, IntoElement, LayoutId, ListState, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollHandle, StyledText,
-    TextLayout, Window, px,
+    TextLayout, Window, fill, point, px, size,
 };
 use gpui_base::{
     ScrollbarHandle, TextSelectionHandle, TextSelectionRegistration, TextSelectionRun,
@@ -215,6 +215,8 @@ pub(crate) struct CodeText {
     selection: TextSelectionHandle,
     geometry: Rc<RefCell<SelectionGeometry>>,
     styled_text: Option<StyledText>,
+    // The merged highlights painted this frame; boxes take their text color.
+    painted: Vec<(Range<usize>, HighlightStyle)>,
 }
 
 impl CodeText {
@@ -241,6 +243,7 @@ impl CodeText {
             selection,
             geometry,
             styled_text: None,
+            painted: Vec::new(),
         }
     }
 }
@@ -293,8 +296,8 @@ impl Element for CodeText {
             })
             .collect();
         let text = line.chunk_text(&self.range);
-        self.styled_text =
-            Some(StyledText::new(text).with_highlights(merge_highlights(self.range.len(), layers)));
+        self.painted = merge_highlights(self.range.len(), layers);
+        self.styled_text = Some(StyledText::new(text).with_highlights(self.painted.clone()));
         self.styled_text
             .as_mut()
             .unwrap()
@@ -340,6 +343,82 @@ impl Element for CodeText {
             window,
             cx,
         );
+        self.paint_special_boxes(window);
+    }
+}
+
+impl CodeText {
+    /// Frames each special-character abbreviation the way IntelliJ IDEA's
+    /// editor does: a line above the capitals and one below the baseline,
+    /// each with short ticks at both ends, in the abbreviation's text color.
+    fn paint_special_boxes(&self, window: &mut Window) {
+        const GAP: f32 = 4.;
+        const TICK: f32 = 2.;
+        const THICKNESS: f32 = 1.;
+        let line = &self.document.lines(self.side)[self.line_ix];
+        let mut specials = line.special_ranges(self.range.clone()).peekable();
+        if specials.peek().is_none() {
+            return;
+        }
+        let Some(layout) = self.styled_text.as_ref().map(StyledText::layout) else {
+            return;
+        };
+        let style = window.text_style();
+        let font_size = style.font_size.to_pixels(window.rem_size());
+        let font_id = window.text_system().resolve_font(&style.font());
+        let text_system = window.text_system();
+        let ascent = text_system.ascent(font_id, font_size);
+        let descent = text_system.descent(font_id, font_size);
+        let cap_height = text_system.cap_height(font_id, font_size);
+        let baseline = text_system.baseline_offset(font_id, font_size, layout.line_height());
+        let boxes: Vec<_> = specials
+            .filter_map(|special| {
+                let start = special.start.checked_sub(self.range.start)?;
+                let end = special.end - self.range.start;
+                let left = layout.position_for_index(start)?;
+                let right = layout.position_for_index(end)?;
+                // A box broken across wrapped rows is not drawn.
+                (left.y == right.y).then_some((start, left, right.x))
+            })
+            .collect();
+        for (start, left, right) in boxes {
+            let color = self
+                .painted
+                .iter()
+                .find(|(range, _)| range.contains(&start))
+                .and_then(|(_, style)| style.color)
+                .unwrap_or(style.color);
+            let baseline = left.y + baseline;
+            let top = baseline - ascent.min(cap_height + px(GAP));
+            let bottom = baseline + descent.min(px(GAP)) - px(THICKNESS);
+            let width = right - left.x;
+            let right = right - px(THICKNESS);
+            for (origin, extent) in [
+                (point(left.x, top), size(width, px(THICKNESS))),
+                (point(left.x, bottom), size(width, px(THICKNESS))),
+                (
+                    point(left.x, top),
+                    size(px(THICKNESS), px(TICK + THICKNESS)),
+                ),
+                (point(right, top), size(px(THICKNESS), px(TICK + THICKNESS))),
+                (
+                    point(left.x, bottom - px(TICK)),
+                    size(px(THICKNESS), px(TICK + THICKNESS)),
+                ),
+                (
+                    point(right, bottom - px(TICK)),
+                    size(px(THICKNESS), px(TICK + THICKNESS)),
+                ),
+            ] {
+                window.paint_quad(fill(
+                    Bounds {
+                        origin,
+                        size: extent,
+                    },
+                    color,
+                ));
+            }
+        }
     }
 }
 

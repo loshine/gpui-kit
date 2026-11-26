@@ -9,6 +9,7 @@ mod parser;
 mod parser_tests;
 mod presentation;
 mod selection;
+mod special_chars;
 mod state;
 
 pub use conflict::{DiffConflict, DiffConflictResolution};
@@ -2349,6 +2350,8 @@ mod review_tests;
 mod scroll_tests;
 #[cfg(test)]
 mod selection_tests;
+#[cfg(test)]
+mod special_chars_tests;
 #[cfg(test)]
 mod split_tests;
 #[cfg(test)]
