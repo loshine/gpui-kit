@@ -387,6 +387,8 @@ struct DocumentInner {
     patch_lines: Vec<PatchLine>,
     patch_ixs: [Vec<usize>; 2],
     conflicts: Vec<DiffConflict>,
+    /// Sides shown as whole documents, see [`DiffFile::with_trailing_lines`].
+    documents: [bool; 2],
 }
 
 /// One changed file parsed from a unified or Git diff.
@@ -465,6 +467,7 @@ impl DiffFile {
                 patch_lines,
                 patch_ixs,
                 conflicts: Vec::new(),
+                documents: [false; 2],
             }),
             language: None,
         }
@@ -495,7 +498,9 @@ impl DiffFile {
     /// by its line break, that pair is no longer marked changed, since only the
     /// trailing line differs. Trailing lines join the last hunk, so context and
     /// folding treat them as the file's last lines; they are not patch lines,
-    /// and change counts stay as the patch reports them.
+    /// and change counts stay as the patch reports them. A requested side
+    /// shows no "No newline at end of file" note, as its missing trailing line
+    /// already shows that.
     pub fn with_trailing_lines(mut self, sides: impl IntoIterator<Item = DiffSide>) -> Self {
         if self.inner.binary || self.status() == DiffFileStatus::Conflicted {
             return self;
@@ -509,6 +514,7 @@ impl DiffFile {
                 continue;
             }
             requested = true;
+            inner.documents[side as usize] = true;
             let file_side = match side {
                 DiffSide::Original => &mut inner.original,
                 DiffSide::Modified => &mut inner.modified,
@@ -708,6 +714,11 @@ impl DiffFile {
     /// a trailing empty line, which the patch does not contain.
     pub(crate) fn patch_ix(&self, side: DiffSide, ix: usize) -> Option<usize> {
         self.inner.patch_ixs[side as usize].get(ix).copied()
+    }
+
+    /// Whether `side` is shown as a whole document, with its trailing line.
+    pub(crate) fn is_document(&self, side: DiffSide) -> bool {
+        self.inner.documents[side as usize]
     }
 
     pub(crate) fn side_path(&self, side: DiffSide) -> Option<&SharedString> {

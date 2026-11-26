@@ -2240,21 +2240,31 @@ fn line_extras(
     let line = &document.lines(side)[ix];
     let ending = &document.source(side)[line.content_end()..line.source().end];
     let ending_only = changed && has_line_ending_change(document, side, ix, other_ix);
-    if ending.is_empty() || ending_only {
+    // A whole document shows a missing final line break by its missing
+    // trailing line instead.
+    let shown_by_document = ending.is_empty() && document.is_document(side);
+    if !shown_by_document && (ending.is_empty() || ending_only) {
         let label = if ending.is_empty() {
             t!("Diff.NoNewline").to_string()
         } else {
             format!("\\ {}", if ending == "\r\n" { "CRLF" } else { "LF" })
         };
-        extras.push(
-            div()
-                .h_6()
-                .px_3()
-                .text_xs()
-                .text_color(cx.theme().muted_foreground)
-                .child(label)
-                .into_any_element(),
-        );
+        let note = div()
+            .h_6()
+            .px_3()
+            .text_xs()
+            .text_color(cx.theme().muted_foreground)
+            .child(label);
+        #[cfg(test)]
+        let note = note.debug_selector({
+            let side = if side == DiffSide::Original {
+                "old"
+            } else {
+                "new"
+            };
+            move || format!("line-note-{side}-{ix}")
+        });
+        extras.push(note.into_any_element());
     }
     extras.extend(line_annotations(file, side, ix, code, window, cx));
     extras

@@ -397,3 +397,17 @@ fn unified_selection_across_sides_ends_at_the_trailing_line(cx: &mut TestAppCont
     let copied = state.read_with(cx, |state, cx| state.selected_text(cx));
     assert_eq!(copied, "b\nx\nc\n");
 }
+
+#[gpui::test]
+fn whole_documents_have_no_missing_line_break_note(cx: &mut TestAppContext) {
+    // The modified side has no final line break; the original ends with one.
+    let plain = full_patch("a.txt", "x\ny\n", "x\ny\nz");
+    let (_, window) = open(cx, plain.clone(), DiffMode::Split, None, false);
+    assert!(has(window, "line-note-new-2"));
+    let document = plain.with_trailing_lines(BOTH);
+    let (_, window) = open(cx, document, DiffMode::Split, None, false);
+    assert!(has(window, "gutter-old-3"));
+    for note in ["line-note-new-2", "line-note-old-2"] {
+        assert!(!has(window, note), "{note}");
+    }
+}
