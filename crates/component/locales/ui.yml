@@ -834,6 +834,12 @@ Diff:
     ru: "Развернуть неизменённые строки: %{count}"
     zh-CN: 展开 %{count} 行未变更内容
     zh-HK: 展開 %{count} 行未變更內容
+  ExpandUnchangedLines:
+    en: Expand unchanged lines
+    pt-BR: "Expandir linhas sem mudança"
+    ru: "Развернуть неизменённые строки"
+    zh-CN: 展开未变更内容
+    zh-HK: 展開未變更內容
   SourceLine:
     en: "%{side} line %{line}"
     pt-BR: "%{side} linha %{line}"

@@ -249,6 +249,9 @@ pub struct DiffState {
     context_lines: Option<usize>,
     expansion_lines: usize,
     min_collapsed_lines: usize,
+    nested_folds: bool,
+    /// The nested fold under the pointer, by file and first pair.
+    hovered_fold: Option<(usize, usize)>,
     expanded: Vec<Vec<Range<usize>>>,
     collapsed: HashSet<SharedString>,
     resolutions: HashMap<(SharedString, usize), DiffConflictResolution>,
@@ -382,6 +385,8 @@ impl DiffState {
             context_lines: Some(3),
             expansion_lines: 20,
             min_collapsed_lines: 2,
+            nested_folds: false,
+            hovered_fold: None,
             collapsed: HashSet::new(),
             resolutions: HashMap::new(),
             file_rows: Vec::new(),
@@ -453,6 +458,20 @@ impl DiffState {
     /// visible. Default is 2.
     pub fn with_min_collapsed_lines(mut self, lines: usize) -> Self {
         self.min_collapsed_lines = lines.max(1);
+        self.rebuild(true);
+        self
+    }
+
+    /// Folds each unchanged range in up to three nested levels: past the
+    /// context, past twice the context, and past four times it, with an edge
+    /// at the start or end of a hunk folding all the way to it. A fold row
+    /// draws as a wavy line and reveals one level per click. Default is
+    /// `false`, where each range folds once behind expansion buttons.
+    ///
+    /// Each level hides at least [`Self::with_min_collapsed_lines`] lines;
+    /// a shorter level does not exist.
+    pub fn with_nested_folds(mut self, enabled: bool) -> Self {
+        self.nested_folds = enabled;
         self.rebuild(true);
         self
     }
@@ -544,6 +563,18 @@ impl DiffState {
         cx.notify();
     }
 
+    /// Changes whether unchanged ranges fold in nested levels; see
+    /// [`Self::with_nested_folds`]. Every level folds again.
+    pub fn set_nested_folds(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if self.nested_folds == enabled {
+            return;
+        }
+        self.nested_folds = enabled;
+        self.expanded.iter_mut().for_each(Vec::clear);
+        self.rebuild_at_anchor();
+        cx.notify();
+    }
+
     /// Changes the inline comparison unit without resetting selection or scrolling.
     pub fn set_inline_unit(&mut self, unit: Option<DiffInlineUnit>, cx: &mut Context<Self>) {
         if self.presentation_options.inline_unit == unit {
@@ -597,6 +628,11 @@ impl DiffState {
     }
     pub fn min_collapsed_lines(&self) -> usize {
         self.min_collapsed_lines
+    }
+
+    /// Whether unchanged ranges fold in nested levels.
+    pub fn nested_folds(&self) -> bool {
+        self.nested_folds
     }
     pub fn inline_unit(&self) -> Option<DiffInlineUnit> {
         self.presentation_options.inline_unit
@@ -1065,6 +1101,31 @@ impl DiffState {
         }
     }
 
+    /// The nested fold under the pointer, by file and first pair.
+    pub(crate) fn hovered_fold(&self) -> Option<(usize, usize)> {
+        self.hovered_fold
+    }
+
+    /// Records the pointer entering or leaving a nested fold's column.
+    pub(crate) fn hover_fold(
+        &mut self,
+        fold: (usize, usize),
+        hovered: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let hovered_fold = if hovered {
+            Some(fold)
+        } else if self.hovered_fold == Some(fold) {
+            None
+        } else {
+            return;
+        };
+        if self.hovered_fold != hovered_fold {
+            self.hovered_fold = hovered_fold;
+            cx.notify();
+        }
+    }
+
     /// Reveals part or all of a collapsed unchanged range.
     pub(crate) fn expand_fold(
         &mut self,
@@ -1426,8 +1487,12 @@ impl DiffState {
     }
 
     fn expand_line(&mut self, position: &DiffLinePosition) -> Option<usize> {
-        let row = self.source_row(position)?;
-        if let Some(DisplayRow::Fold { file, pairs }) = self.rows.get(row) {
+        // Nested folds reveal one level at a time, at most three.
+        for _ in 0..3 {
+            let row = self.source_row(position)?;
+            let Some(DisplayRow::Fold { file, pairs }) = self.rows.get(row) else {
+                break;
+            };
             let (file, pairs) = (*file, pairs.clone());
             self.expanded[file].push(pairs);
             self.rebuild_at_anchor();
@@ -1651,19 +1716,19 @@ impl DiffState {
                     file,
                     self.context_lines,
                     self.min_collapsed_lines,
+                    self.nested_folds,
                     &self.expanded[ix],
                 );
                 project_conflicts(&mut rows, ix, file, &visible, &resolutions);
             } else {
-                project_file(
-                    &mut rows,
-                    ix,
+                let visible = visible_pairs(
                     file,
-                    self.mode,
                     self.context_lines,
                     self.min_collapsed_lines,
+                    self.nested_folds,
                     &self.expanded[ix],
                 );
+                project_file(&mut rows, ix, file, self.mode, &visible);
             }
         }
         rows
@@ -1876,13 +1941,18 @@ fn hunk_ends(document: &DiffFile) -> Vec<usize> {
 }
 
 /// Which pairs show as code: changes with their context, expanded ranges,
-/// and collapsed ranges shorter than `min_collapsed_lines`.
+/// and collapsed ranges shorter than `min_collapsed_lines`. Nested folds
+/// hide only the outermost level of each range not yet expanded.
 fn visible_pairs(
     document: &DiffFile,
     context: Option<usize>,
     min_collapsed_lines: usize,
+    nested: bool,
     expanded: &[Range<usize>],
 ) -> Vec<bool> {
+    if nested {
+        return nested_visible_pairs(document, context, min_collapsed_lines, expanded);
+    }
     let pairs = document.pairs();
     let hunks = document.hunks();
     let mut hunk_end = vec![pairs.len(); pairs.len()];
@@ -1946,19 +2016,98 @@ fn visible_pairs(
     visible
 }
 
+/// The nested fold levels of the unchanged pairs `range` within a hunk,
+/// outermost first.
+///
+/// Level `k` leaves `context << k` lines beside each change; an edge at the
+/// hunk's start or end leaves none. A level hiding fewer than
+/// `min_collapsed_lines` lines does not exist, and equal levels are one.
+pub(crate) fn fold_levels(
+    range: Range<usize>,
+    hunk: Range<usize>,
+    context: usize,
+    min_collapsed_lines: usize,
+) -> Vec<Range<usize>> {
+    let mut levels: Vec<Range<usize>> = Vec::new();
+    for level in 0..3 {
+        let shift = context << level;
+        let start = if range.start == hunk.start {
+            range.start
+        } else {
+            range.start.saturating_add(shift)
+        };
+        let end = if range.end == hunk.end {
+            range.end
+        } else {
+            range.end.saturating_sub(shift)
+        };
+        if end < start.saturating_add(min_collapsed_lines) {
+            break;
+        }
+        if levels.last() != Some(&(start..end)) {
+            levels.push(start..end);
+        }
+    }
+    levels
+}
+
+/// Visibility with nested folds: in each unchanged range, the first level
+/// not yet expanded hides and everything outside it shows.
+///
+/// A level is expanded when `expanded` holds exactly its range, or a range
+/// covering the whole unchanged range.
+fn nested_visible_pairs(
+    document: &DiffFile,
+    context: Option<usize>,
+    min_collapsed_lines: usize,
+    expanded: &[Range<usize>],
+) -> Vec<bool> {
+    let pairs = document.pairs();
+    let mut visible = vec![true; pairs.len()];
+    let Some(context) = context else {
+        return visible;
+    };
+    let mut hunk_bounds = vec![0..pairs.len(); pairs.len()];
+    for hunk in document.hunks() {
+        hunk_bounds[hunk.pairs()].fill(hunk.pairs());
+    }
+    let mut ix = 0;
+    while ix < pairs.len() {
+        if pairs[ix].is_changed() {
+            ix += 1;
+            continue;
+        }
+        let hunk = hunk_bounds[ix].clone();
+        let start = ix;
+        while ix < hunk.end && !pairs[ix].is_changed() {
+            ix += 1;
+        }
+        let range = start..ix;
+        let revealed = |level: &Range<usize>| {
+            expanded.iter().any(|expanded| {
+                expanded == level || (expanded.start <= range.start && range.end <= expanded.end)
+            })
+        };
+        if let Some(level) = fold_levels(range.clone(), hunk, context, min_collapsed_lines)
+            .into_iter()
+            .find(|level| !revealed(level))
+        {
+            visible[level].fill(false);
+        }
+    }
+    visible
+}
+
 fn project_file(
     rows: &mut Vec<DisplayRow>,
     file: usize,
     document: &DiffFile,
     mode: DiffMode,
-    context: Option<usize>,
-    min_collapsed_lines: usize,
-    expanded: &[Range<usize>],
+    visible: &[bool],
 ) {
     let pairs = document.pairs();
     let hunks = document.hunks();
     let hunk_end = hunk_ends(document);
-    let visible = visible_pairs(document, context, min_collapsed_lines, expanded);
     let mut hunk_ix = 0;
     let mut ix = 0;
     while ix < pairs.len() {

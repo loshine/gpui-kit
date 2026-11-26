@@ -621,6 +621,7 @@ fn render_diff(
         gutter_width,
         rem,
         expansion_lines: state.expansion_lines(),
+        nested_folds: state.nested_folds(),
         line_number: props.line_number,
         syntax_highlight: props.syntax_highlight,
         header_visible: props.header_visible,
@@ -897,6 +898,7 @@ struct CodePresentation {
     gutter_width: Pixels,
     rem: Pixels,
     expansion_lines: usize,
+    nested_folds: bool,
     line_number: bool,
     syntax_highlight: bool,
     header_visible: bool,
@@ -1053,6 +1055,9 @@ fn render_row(
             None => render_notice(&code.files[*file], cx),
         },
         DisplayRow::Hunk { file, hunk } => render_hunk_separator(*file, *hunk, &code, cx),
+        DisplayRow::Fold { file, pairs } if code.nested_folds => {
+            render_wave_fold(*file, pairs.clone(), &code, cx)
+        }
         DisplayRow::Fold { file, pairs } => render_fold(*file, pairs.clone(), &code, cx),
         DisplayRow::Conflict {
             file,
@@ -1209,6 +1214,118 @@ fn render_fold(
                 .accessibility_label(t!("Diff.ExpandLines", count = pairs.len()).to_string()),
         )
         .into_any_element()
+}
+
+/// A nested fold: a wavy line across the row, with no line number or text.
+/// A click in a column reveals one level; in split mode the divider between
+/// the columns carries the line but takes no pointer input.
+fn render_wave_fold(
+    file: usize,
+    pairs: std::ops::Range<usize>,
+    code: &CodePresentation,
+    cx: &App,
+) -> AnyElement {
+    let fold = (file, pairs.start);
+    let color = if code.state.read(cx).hovered_fold() == Some(fold) {
+        cx.theme().muted_foreground
+    } else {
+        cx.theme().border
+    };
+    let column = |id: &'static str, width: Option<Pixels>| {
+        let hover = code.state.clone();
+        let click = code.state.clone();
+        let pairs = pairs.clone();
+        div()
+            .id((id, pairs.start))
+            .test_support()
+            .map(|this| {
+                #[cfg(test)]
+                let this = this.debug_selector(move || format!("{id}-{}", fold.1));
+                this
+            })
+            .h(code.row_height)
+            .flex_shrink_0()
+            .map(|this| match width {
+                Some(width) => this.w(width),
+                None => this.w_full().min_w(code.content_width),
+            })
+            .cursor_pointer()
+            .role(gpui::accesskit::Role::Button)
+            .aria_label(t!("Diff.ExpandUnchangedLines").to_string())
+            .on_hover(move |hovered, _, cx| {
+                hover.update(cx, |state, cx| state.hover_fold(fold, *hovered, cx))
+            })
+            .on_click(move |_, _, cx| {
+                click.update(cx, |state, cx| {
+                    state.expand_fold(file, pairs.clone(), FoldExpansion::All, cx)
+                })
+            })
+            .child(wave(color))
+    };
+    if code.mode == DiffMode::Split && code.single_column_side(file).is_none() {
+        h_flex()
+            .w_full()
+            .when(code.split_scroll, |this| {
+                this.child(div().w(code.split_shift).flex_shrink_0())
+            })
+            .child(column("fold-old", Some(code.column_width)))
+            .when(code.divider_marker_content.is_some(), |this| {
+                this.child(
+                    div()
+                        .map(|this| {
+                            #[cfg(test)]
+                            let this =
+                                this.debug_selector(move || format!("fold-divider-{}", fold.1));
+                            this
+                        })
+                        .h(code.row_height)
+                        .w(code.divider_width)
+                        .flex_shrink_0()
+                        .child(wave(color)),
+                )
+            })
+            .child(column("fold-new", Some(code.column_width)))
+            .into_any_element()
+    } else {
+        column("fold", None).into_any_element()
+    }
+}
+
+/// A zigzag line through the middle of its parent, its phase fixed to the
+/// window so lines in neighboring elements join.
+fn wave(color: Hsla) -> impl IntoElement {
+    const PERIOD: f32 = 8.;
+    const AMPLITUDE: f32 = 2.;
+    gpui::canvas(
+        |_, _, _| {},
+        move |bounds, _, window, _| {
+            let middle = bounds.center().y;
+            let left = f32::from(bounds.left());
+            let right = f32::from(bounds.right());
+            let mut x = (left / PERIOD).floor() * PERIOD;
+            let mut builder = gpui::PathBuilder::stroke(px(1.));
+            let at = |x: f32| {
+                let phase = (x / PERIOD).rem_euclid(1.);
+                let offset = if phase < 0.5 {
+                    AMPLITUDE - 4. * AMPLITUDE * phase
+                } else {
+                    -3. * AMPLITUDE + 4. * AMPLITUDE * phase
+                };
+                point(px(x), middle + px(offset))
+            };
+            builder.move_to(at(x));
+            while x < right {
+                x += PERIOD / 2.;
+                builder.line_to(at(x));
+            }
+            window.with_content_mask(Some(gpui::ContentMask { bounds }), |window| {
+                if let Ok(path) = builder.build() {
+                    window.paint_path(path, color);
+                }
+            });
+        },
+    )
+    .size_full()
 }
 
 /// The heading of one part of a conflict, with the resolution commands on
@@ -2338,6 +2455,8 @@ mod copy_tests;
 mod decoration_tests;
 #[cfg(test)]
 mod divider_tests;
+#[cfg(test)]
+mod fold_tests;
 #[cfg(test)]
 mod header_tests;
 #[cfg(test)]
