@@ -944,7 +944,10 @@ fn source_line_with(
         let mut chars = content.char_indices().peekable();
         while let Some((ix, ch)) = chars.next() {
             let next = chars.peek().map(|(_, next)| *next);
-            let abbreviation = special
+            // A byte order mark opening the file marks its encoding and is
+            // not shown as a character.
+            let bom = line_number == 1 && ix == 0 && ch == '\u{FEFF}';
+            let abbreviation = (special && !bom)
                 .then(|| special_chars::abbreviation_in(ch, previous, next))
                 .flatten();
             if ch == '\t' {
@@ -1403,6 +1406,26 @@ mod tests {
             "line\0two changed\n"
         );
         assert_eq!(marked.pairs(), document.pairs());
+    }
+
+    #[test]
+    fn a_byte_order_mark_opening_the_file_is_not_boxed() {
+        let document = fixture::modified(
+            "bom.txt",
+            "\u{FEFF}first\nsecond\n",
+            "\u{FEFF}first\nsec\u{FEFF}ond\n",
+        )
+        .with_special_characters();
+        for side in [DiffSide::Original, DiffSide::Modified] {
+            let first = &document.lines(side)[0];
+            assert_eq!(first.display().as_str(), "\u{FEFF}first");
+            assert_eq!(first.special_ranges(0..first.display().len()).count(), 0);
+        }
+        // Inside a line it is the zero width no-break space.
+        assert_eq!(
+            document.lines(DiffSide::Modified)[1].display().as_str(),
+            "secZWNBSPond"
+        );
     }
 
     #[test]

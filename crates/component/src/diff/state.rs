@@ -252,6 +252,11 @@ pub struct DiffState {
     nested_folds: bool,
     /// The nested fold under the pointer, by file and first pair.
     hovered_fold: Option<(usize, usize)>,
+    /// The line-number column under the pointer, by file, side and line, where
+    /// nested fold anchors show.
+    hovered_gutter: Option<(usize, DiffSide, usize)>,
+    /// Per file, the expanded nested levels by the pair each starts at.
+    fold_anchors: Vec<Vec<(usize, Range<usize>)>>,
     expanded: Vec<Vec<Range<usize>>>,
     collapsed: HashSet<SharedString>,
     resolutions: HashMap<(SharedString, usize), DiffConflictResolution>,
@@ -387,6 +392,8 @@ impl DiffState {
             min_collapsed_lines: 2,
             nested_folds: false,
             hovered_fold: None,
+            hovered_gutter: None,
+            fold_anchors: Vec::new(),
             collapsed: HashSet::new(),
             resolutions: HashMap::new(),
             file_rows: Vec::new(),
@@ -571,6 +578,8 @@ impl DiffState {
         }
         self.nested_folds = enabled;
         self.expanded.iter_mut().for_each(Vec::clear);
+        // The line-number column gains or loses its anchor lane.
+        self.layout = None;
         self.rebuild_at_anchor();
         cx.notify();
     }
@@ -733,6 +742,10 @@ impl DiffState {
             return;
         }
         self.mode = mode;
+        // Nested folds start over in the other layout, as IntelliJ's do.
+        if self.nested_folds {
+            self.expanded.iter_mut().for_each(Vec::clear);
+        }
         self.rebuild_at_anchor();
         self.horizontal_scroll.set_offset(point(px(0.), px(0.)));
         cx.notify();
@@ -1099,6 +1112,199 @@ impl DiffState {
                 }
             }
         }
+    }
+
+    /// The expanded nested levels of each file by the pair each starts at.
+    fn project_fold_anchors(&self) -> Vec<Vec<(usize, Range<usize>)>> {
+        self.files
+            .iter()
+            .zip(&self.expanded)
+            .map(|(file, expanded)| {
+                if !self.nested_folds || file.status() == DiffFileStatus::Conflicted {
+                    return Vec::new();
+                }
+                fold_segments(file, self.context_lines, self.min_collapsed_lines)
+                    .iter()
+                    .flat_map(|segment| {
+                        segment
+                            .open_levels(expanded)
+                            .map(|level| (level.start, level.clone()))
+                            .collect::<Vec<_>>()
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// The expanded nested level whose first row shows line `ix` of `side`;
+    /// its anchor folds it again.
+    pub(crate) fn fold_anchor(
+        &self,
+        file: usize,
+        side: DiffSide,
+        ix: usize,
+    ) -> Option<Range<usize>> {
+        let pairs = self.files.get(file)?.pairs();
+        self.fold_anchors
+            .get(file)?
+            .iter()
+            .find(|(pair, _)| {
+                let pair = pairs[*pair];
+                match side {
+                    DiffSide::Original => pair.original() == Some(ix),
+                    DiffSide::Modified => pair.modified() == Some(ix),
+                }
+            })
+            .map(|(_, level)| level.clone())
+    }
+
+    /// The line-number column under the pointer, by file, side and line.
+    pub(crate) fn hovered_gutter(&self) -> Option<(usize, DiffSide, usize)> {
+        self.hovered_gutter
+    }
+
+    /// Records the pointer entering or leaving a line number.
+    pub(crate) fn hover_gutter(
+        &mut self,
+        gutter: (usize, DiffSide, usize),
+        hovered: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let hovered_gutter = if hovered {
+            Some(gutter)
+        } else if self.hovered_gutter == Some(gutter) {
+            None
+        } else {
+            return;
+        };
+        if self.hovered_gutter != hovered_gutter {
+            self.hovered_gutter = hovered_gutter;
+            cx.notify();
+        }
+    }
+
+    /// Replaces ranges covering whole unchanged ranges, as expanding
+    /// everything records, with the levels they expand, so one level can
+    /// fold again on its own.
+    fn explicit_levels(&mut self, file: usize) -> Vec<FoldSegment> {
+        let segments = fold_segments(
+            &self.files[file],
+            self.context_lines,
+            self.min_collapsed_lines,
+        );
+        let expanded = &self.expanded[file];
+        let explicit = segments
+            .iter()
+            .flat_map(|segment| segment.open_levels(expanded).cloned().collect::<Vec<_>>())
+            .collect();
+        self.expanded[file] = explicit;
+        segments
+    }
+
+    /// Folds an expanded nested level again; deeper levels keep their state.
+    pub(crate) fn collapse_fold(
+        &mut self,
+        file: usize,
+        level: Range<usize>,
+        cx: &mut Context<Self>,
+    ) {
+        if file >= self.files.len() {
+            return;
+        }
+        self.explicit_levels(file);
+        self.expanded[file].retain(|expanded| *expanded != level);
+        self.rebuild_at_anchor();
+        cx.notify();
+    }
+
+    /// Folds again the innermost expanded nested level holding `position`.
+    /// Returns whether a level folded; a line outside every expanded level
+    /// changes nothing.
+    pub fn collapse_fold_at(
+        &mut self,
+        position: &DiffLinePosition,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(file) = self.file_ix(position.path()) else {
+            return false;
+        };
+        let document = &self.files[file];
+        let Some(ix) = document
+            .lines(position.side())
+            .iter()
+            .position(|line| line.line_number() == position.line())
+        else {
+            return false;
+        };
+        let Some(pair) = document
+            .pairs()
+            .iter()
+            .position(|pair| match position.side() {
+                DiffSide::Original => pair.original() == Some(ix),
+                DiffSide::Modified => pair.modified() == Some(ix),
+            })
+        else {
+            return false;
+        };
+        let segments = fold_segments(document, self.context_lines, self.min_collapsed_lines);
+        let Some(level) = segments.iter().find_map(|segment| {
+            segment
+                .open_levels(&self.expanded[file])
+                .filter(|level| level.contains(&pair))
+                .last()
+                .cloned()
+        }) else {
+            return false;
+        };
+        self.collapse_fold(file, level, cx);
+        true
+    }
+
+    /// What the nested folds of the file at `path` look like, to carry over
+    /// to a new reading of it; `None` without nested folds.
+    pub fn fold_memory(&self, path: &str) -> Option<DiffFoldMemory> {
+        if !self.nested_folds {
+            return None;
+        }
+        let file = self.file_ix(path)?;
+        let document = &self.files[file];
+        let mut memory = DiffFoldMemory {
+            expanded: Vec::new(),
+            collapsed: Vec::new(),
+        };
+        for segment in fold_segments(document, self.context_lines, self.min_collapsed_lines) {
+            let expanded = &self.expanded[file];
+            if let Some(level) = segment.open_levels(expanded).next() {
+                memory.expanded.extend(side_lines(document, level));
+            }
+            if let Some(level) = segment.folded_level(expanded) {
+                memory.collapsed.extend(side_lines(document, level));
+            }
+        }
+        Some(memory)
+    }
+
+    /// Expands the nested levels of the file at `path` that `memory`, taken
+    /// from an earlier reading, had expanded: a level within a remembered
+    /// folded range folds, one within a remembered expanded range on both
+    /// sides expands, and the rest fold by default.
+    pub fn restore_folds(&mut self, path: &str, memory: &DiffFoldMemory, cx: &mut Context<Self>) {
+        let Some(file) = self.file_ix(path) else {
+            return;
+        };
+        let document = &self.files[file];
+        let mut expanded = Vec::new();
+        for segment in fold_segments(document, self.context_lines, self.min_collapsed_lines) {
+            for level in &segment.levels {
+                match side_lines(document, level) {
+                    Some(lines) if memory.expands(&lines) => expanded.push(level.clone()),
+                    _ => break,
+                }
+            }
+        }
+        self.expanded[file] = expanded;
+        self.rebuild_at_anchor();
+        cx.notify();
     }
 
     /// The nested fold under the pointer, by file and first pair.
@@ -1661,6 +1867,7 @@ impl DiffState {
     /// Projects rows. Without `reset`, only the changed middle is spliced so
     /// measured heights of unchanged rows survive disclosure changes.
     fn rebuild(&mut self, reset: bool) {
+        self.fold_anchors = self.project_fold_anchors();
         let rows = self.project_rows();
         self.file_rows = source_rows(&self.files, &rows);
         self.change_rows = changed_groups(&rows);
@@ -2051,26 +2258,57 @@ pub(crate) fn fold_levels(
     levels
 }
 
-/// Visibility with nested folds: in each unchanged range, the first level
-/// not yet expanded hides and everything outside it shows.
-///
-/// A level is expanded when `expanded` holds exactly its range, or a range
-/// covering the whole unchanged range.
-fn nested_visible_pairs(
+/// One unchanged range of a file with its nested levels, outermost first.
+#[derive(Clone, Debug)]
+pub(crate) struct FoldSegment {
+    range: Range<usize>,
+    levels: Vec<Range<usize>>,
+}
+
+impl FoldSegment {
+    /// Whether `level` is expanded: `expanded` holds exactly its range, or a
+    /// range covering the whole unchanged range.
+    fn revealed(&self, level: &Range<usize>, expanded: &[Range<usize>]) -> bool {
+        expanded.iter().any(|expanded| {
+            expanded == level
+                || (expanded.start <= self.range.start && self.range.end <= expanded.end)
+        })
+    }
+
+    /// The expanded levels from the outermost in, up to the first folded one.
+    fn open_levels<'a>(
+        &'a self,
+        expanded: &'a [Range<usize>],
+    ) -> impl Iterator<Item = &'a Range<usize>> + 'a {
+        self.levels
+            .iter()
+            .take_while(move |level| self.revealed(level, expanded))
+    }
+
+    /// The outermost level not yet expanded, which hides as one fold.
+    fn folded_level(&self, expanded: &[Range<usize>]) -> Option<&Range<usize>> {
+        self.levels
+            .iter()
+            .find(|level| !self.revealed(level, expanded))
+    }
+}
+
+/// Every unchanged range of `document` with nested levels, in order;
+/// `None` context folds nothing.
+pub(crate) fn fold_segments(
     document: &DiffFile,
     context: Option<usize>,
     min_collapsed_lines: usize,
-    expanded: &[Range<usize>],
-) -> Vec<bool> {
+) -> Vec<FoldSegment> {
     let pairs = document.pairs();
-    let mut visible = vec![true; pairs.len()];
     let Some(context) = context else {
-        return visible;
+        return Vec::new();
     };
     let mut hunk_bounds = vec![0..pairs.len(); pairs.len()];
     for hunk in document.hunks() {
         hunk_bounds[hunk.pairs()].fill(hunk.pairs());
     }
+    let mut segments = Vec::new();
     let mut ix = 0;
     while ix < pairs.len() {
         if pairs[ix].is_changed() {
@@ -2082,20 +2320,71 @@ fn nested_visible_pairs(
         while ix < hunk.end && !pairs[ix].is_changed() {
             ix += 1;
         }
-        let range = start..ix;
-        let revealed = |level: &Range<usize>| {
-            expanded.iter().any(|expanded| {
-                expanded == level || (expanded.start <= range.start && range.end <= expanded.end)
-            })
-        };
-        if let Some(level) = fold_levels(range.clone(), hunk, context, min_collapsed_lines)
-            .into_iter()
-            .find(|level| !revealed(level))
-        {
-            visible[level].fill(false);
+        let levels = fold_levels(start..ix, hunk, context, min_collapsed_lines);
+        if !levels.is_empty() {
+            segments.push(FoldSegment {
+                range: start..ix,
+                levels,
+            });
+        }
+    }
+    segments
+}
+
+/// Visibility with nested folds: in each unchanged range, the first level
+/// not yet expanded hides and everything outside it shows.
+fn nested_visible_pairs(
+    document: &DiffFile,
+    context: Option<usize>,
+    min_collapsed_lines: usize,
+    expanded: &[Range<usize>],
+) -> Vec<bool> {
+    let mut visible = vec![true; document.pairs().len()];
+    for segment in fold_segments(document, context, min_collapsed_lines) {
+        if let Some(level) = segment.folded_level(expanded) {
+            visible[level.clone()].fill(false);
         }
     }
     visible
+}
+
+/// The line ranges a run of pairs covers on each side, one-based with an
+/// exclusive end; `None` when a pair lacks a side.
+fn side_lines(document: &DiffFile, pairs: &Range<usize>) -> Option<[Range<usize>; 2]> {
+    let first = document.pairs().get(pairs.start)?;
+    let last = document.pairs().get(pairs.end.checked_sub(1)?)?;
+    let lines = |side: DiffSide, first: Option<usize>, last: Option<usize>| {
+        Some(document.line_number(side, first?)..document.line_number(side, last?) + 1)
+    };
+    Some([
+        lines(DiffSide::Original, first.original(), last.original())?,
+        lines(DiffSide::Modified, first.modified(), last.modified())?,
+    ])
+}
+
+/// What a file's nested folds looked like, to carry over to a new reading
+/// of it with [`DiffState::restore_folds`]. Taken by [`DiffState::fold_memory`].
+///
+/// For each unchanged range it keeps the line ranges of the outermost
+/// expanded level and of the outermost folded one, on both sides.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DiffFoldMemory {
+    expanded: Vec<[Range<usize>; 2]>,
+    collapsed: Vec<[Range<usize>; 2]>,
+}
+
+impl DiffFoldMemory {
+    /// Whether a level covering `lines` stays expanded: it lies within a
+    /// remembered folded level on neither side and within a remembered
+    /// expanded level on both. Any doubt keeps the default, folded.
+    fn expands(&self, lines: &[Range<usize>; 2]) -> bool {
+        let within = |ranges: &[[Range<usize>; 2]], side: usize| {
+            ranges.iter().any(|range| {
+                range[side].start <= lines[side].start && lines[side].end <= range[side].end
+            })
+        };
+        (0..2).all(|side| !within(&self.collapsed, side) && within(&self.expanded, side))
+    }
 }
 
 fn project_file(

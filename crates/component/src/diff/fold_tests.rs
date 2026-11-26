@@ -5,7 +5,7 @@ use std::ops::Range;
 use gpui::{AppContext as _, Entity, TestAppContext};
 
 use super::{
-    DiffFile, DiffMode, DiffSide, DiffState,
+    DiffFile, DiffLinePosition, DiffMode, DiffSide, DiffState,
     state::{DisplayRow, FoldExpansion, fold_levels},
 };
 
@@ -311,4 +311,247 @@ mod rendered {
             assert_eq!(last_line(&state, cx), Some(last));
         }
     }
+
+    fn hover(cx: &mut VisualTestContext, selector: &'static str) {
+        let bounds = cx.debug_bounds(selector).expect(selector);
+        cx.simulate_mouse_move(bounds.center(), None, Default::default());
+        draw(cx);
+    }
+
+    #[gpui::test]
+    fn the_anchor_on_the_line_numbers_folds_its_level(cx: &mut TestAppContext) {
+        let (state, cx) = open(cx, DiffMode::Split);
+        click(cx, "fold-new-5".into(), false);
+        assert_eq!(last_line(&state, cx), Some(9));
+        // Hidden until the pointer is over the line numbers, and only on
+        // the first line of the level.
+        assert!(cx.debug_bounds("fold-anchor-5").is_none());
+        hover(cx, "gutter-new-8");
+        let anchor = cx.debug_bounds("fold-anchor-5").expect("anchor");
+        let line = cx.debug_bounds("gutter-new-6").expect("line 6");
+        assert_eq!(anchor.center().y, line.center().y);
+        assert!(anchor.right() <= line.left());
+        // Over the code it hides again.
+        hover(cx, "fold-new-9");
+        assert!(cx.debug_bounds("fold-anchor-5").is_none());
+        // The left column shows its own.
+        hover(cx, "gutter-old-7");
+        let anchor = cx.debug_bounds("fold-anchor-5").expect("left anchor");
+        assert!(anchor.right() <= cx.debug_bounds("gutter-old-6").unwrap().left());
+        cx.simulate_click(anchor.center(), Default::default());
+        draw(cx);
+        assert_eq!(last_line(&state, cx), Some(5));
+        assert!(cx.debug_bounds("fold-anchor-5").is_none());
+    }
+
+    #[gpui::test]
+    fn unified_shows_the_anchor_after_both_line_numbers(cx: &mut TestAppContext) {
+        let (state, cx) = open(cx, DiffMode::Unified);
+        click(cx, "fold-5".into(), false);
+        click(cx, "fold-9".into(), false);
+        assert_eq!(last_line(&state, cx), Some(17));
+        hover(cx, "gutter-old-3");
+        let anchor = cx.debug_bounds("fold-anchor-5").expect("anchor");
+        assert!(anchor.left() >= cx.debug_bounds("gutter-old-6").unwrap().right());
+        assert!(cx.debug_bounds("fold-anchor-9").is_some());
+        cx.simulate_click(anchor.center(), Default::default());
+        draw(cx);
+        assert_eq!(last_line(&state, cx), Some(5));
+        // The deeper level kept its state.
+        click(cx, "fold-5".into(), false);
+        assert_eq!(last_line(&state, cx), Some(17));
+    }
+
+    struct Rooted {
+        state: Entity<DiffState>,
+    }
+
+    impl Render for Rooted {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .w(px(600.))
+                .h(px(900.))
+                .child(Diff::new(&self.state).size_full())
+        }
+    }
+
+    fn open_rooted(
+        cx: &mut TestAppContext,
+        mode: DiffMode,
+        lines: usize,
+    ) -> (Entity<DiffState>, VisualTestContext) {
+        cx.update(|cx| {
+            crate::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        let state = cx.new(|cx| {
+            DiffState::new([document("long.txt", lines, &[1])], cx)
+                .with_mode(mode)
+                .with_context_lines(Some(4))
+                .with_nested_folds(true)
+        });
+        let window = cx.update(|cx| {
+            let rooted = cx.new(|_| Rooted {
+                state: state.clone(),
+            });
+            cx.open_window(
+                gpui::WindowOptions {
+                    window_bounds: Some(gpui::WindowBounds::Windowed(gpui::Bounds::new(
+                        gpui::point(px(0.), px(0.)),
+                        gpui::size(px(800.), px(1000.)),
+                    ))),
+                    ..Default::default()
+                },
+                |window, cx| cx.new(|cx| crate::Root::new(rooted, window, cx)),
+            )
+            .unwrap()
+        });
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        draw(&mut cx);
+        (state, cx)
+    }
+
+    fn wait(cx: &mut VisualTestContext) {
+        cx.executor()
+            .advance_clock(std::time::Duration::from_secs(1));
+        draw(cx);
+    }
+
+    #[gpui::test]
+    fn resting_on_a_fold_previews_the_hidden_lines(cx: &mut TestAppContext) {
+        let (_, mut cx) = open_rooted(cx, DiffMode::Split, 20);
+        let cx = &mut cx;
+        assert!(cx.debug_bounds("fold-preview-line-6").is_none());
+        hover(cx, "fold-new-5");
+        wait(cx);
+        // Lines 6 to the empty line 21, as IntelliJ IDEA lists them.
+        for line in [6, 13, 21] {
+            assert!(
+                cx.debug_bounds(format!("fold-preview-line-{line}").leak())
+                    .is_some(),
+                "line {line}"
+            );
+        }
+        assert!(cx.debug_bounds("fold-preview-line-5").is_none());
+    }
+
+    #[gpui::test]
+    fn the_preview_lists_only_what_half_the_window_holds(cx: &mut TestAppContext) {
+        let (_, mut cx) = open_rooted(cx, DiffMode::Unified, 200);
+        let cx = &mut cx;
+        hover(cx, "fold-5");
+        wait(cx);
+        let first = cx.debug_bounds("fold-preview-line-6").expect("first line");
+        assert!(cx.debug_bounds("fold-preview-line-120").is_none());
+        let shown = (6..120)
+            .filter(|line| {
+                cx.debug_bounds(format!("fold-preview-line-{line}").leak())
+                    .is_some()
+            })
+            .count();
+        // Half the window, and the row cut off at its edge.
+        let half = cx.update(|window, _| f32::from(window.viewport_size().height) / 2.);
+        let height = f32::from(first.size.height);
+        // Row bounds snap to whole pixels.
+        let rows = shown as f32;
+        assert!(
+            rows * height >= half && (rows - 1.) * (height - 1.) < half,
+            "{shown} rows of {height} in {half}"
+        );
+        assert!(shown > 10, "{shown} rows");
+    }
+}
+
+#[gpui::test]
+fn folding_a_level_again_keeps_deeper_levels(cx: &mut TestAppContext) {
+    let state = state(cx, document("long.txt", 20, &[1]), DiffMode::Split);
+    click_first_fold(&state, cx);
+    click_first_fold(&state, cx);
+    assert_eq!(last_shown(&state, cx), Some(17));
+    state.update(cx, |state, cx| state.collapse_fold(0, 5..21, cx));
+    assert_eq!(last_shown(&state, cx), Some(5));
+    // The level below was left expanded and shows again with this one.
+    click_first_fold(&state, cx);
+    assert_eq!(last_shown(&state, cx), Some(17));
+    // After expanding everything, one level folds on its own.
+    state.update(cx, |state, cx| state.expand_unchanged(cx));
+    state.update(cx, |state, cx| state.collapse_fold(0, 9..21, cx));
+    assert_eq!(last_shown(&state, cx), Some(9));
+    click_first_fold(&state, cx);
+    assert_eq!(last_shown(&state, cx), Some(21));
+}
+
+#[gpui::test]
+fn collapsing_at_a_line_folds_its_innermost_expanded_level(cx: &mut TestAppContext) {
+    let state = state(cx, document("long.txt", 20, &[1]), DiffMode::Split);
+    let at = |line| DiffLinePosition::new("long.txt", DiffSide::Modified, line);
+    state.update(cx, |state, cx| state.expand_unchanged(cx));
+    // Line 3 lies in no level.
+    assert!(!state.update(cx, |state, cx| state.collapse_fold_at(&at(3), cx)));
+    assert_eq!(last_shown(&state, cx), Some(21));
+    // Line 18 lies in all three; the innermost folds.
+    assert!(state.update(cx, |state, cx| state.collapse_fold_at(&at(18), cx)));
+    assert_eq!(last_shown(&state, cx), Some(17));
+    assert!(state.update(cx, |state, cx| state.collapse_fold_at(&at(12), cx)));
+    assert_eq!(last_shown(&state, cx), Some(9));
+    assert!(state.update(cx, |state, cx| state.collapse_fold_at(&at(7), cx)));
+    assert_eq!(last_shown(&state, cx), Some(5));
+    // A folded line is in no expanded level.
+    assert!(!state.update(cx, |state, cx| state.collapse_fold_at(&at(7), cx)));
+}
+
+#[gpui::test]
+fn expanded_levels_carry_over_to_a_new_reading(cx: &mut TestAppContext) {
+    let state = state(cx, document("long.txt", 20, &[1]), DiffMode::Split);
+    click_first_fold(&state, cx);
+    assert_eq!(last_shown(&state, cx), Some(9));
+    let memory = state
+        .read_with(cx, |state, _| state.fold_memory("long.txt"))
+        .unwrap();
+    // Line 2 changes too: the levels move down one line.
+    state.update(cx, |state, cx| {
+        state.set_files([document("long.txt", 20, &[1, 2])], cx);
+    });
+    assert_eq!(last_shown(&state, cx), Some(6));
+    state.update(cx, |state, cx| state.restore_folds("long.txt", &memory, cx));
+    assert_eq!(last_shown(&state, cx), Some(10));
+    // Nothing expanded remembers nothing expanded.
+    let folded = state.update(cx, |state, cx| {
+        state.collapse_unchanged(cx);
+        state.fold_memory("long.txt").unwrap()
+    });
+    state.update(cx, |state, cx| {
+        state.expand_unchanged(cx);
+        state.restore_folds("long.txt", &folded, cx);
+    });
+    assert_eq!(last_shown(&state, cx), Some(6));
+    // An unknown path changes nothing.
+    assert!(
+        state
+            .read_with(cx, |state, _| state.fold_memory("other.txt"))
+            .is_none()
+    );
+}
+
+#[gpui::test]
+fn switching_the_layout_folds_every_level(cx: &mut TestAppContext) {
+    let state = state(cx, document("long.txt", 20, &[1]), DiffMode::Split);
+    click_first_fold(&state, cx);
+    state.update(cx, |state, cx| state.set_mode(DiffMode::Unified, cx));
+    assert_eq!(last_shown(&state, cx), Some(5));
+}
+
+#[gpui::test]
+fn without_nested_folds_nothing_is_remembered(cx: &mut TestAppContext) {
+    let state = cx
+        .new(|cx| DiffState::new([document("long.txt", 20, &[1])], cx).with_context_lines(Some(4)));
+    assert!(
+        state
+            .read_with(cx, |state, _| state.fold_memory("long.txt"))
+            .is_none()
+    );
+    // Without nested folds a range stays expanded across layouts, as before.
+    click_first_fold(&state, cx);
+    state.update(cx, |state, cx| state.set_mode(DiffMode::Unified, cx));
+    assert_eq!(last_shown(&state, cx), Some(21));
 }

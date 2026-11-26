@@ -17,7 +17,7 @@ pub use decoration::{DiffDecoration, DiffGutterMarker};
 pub use document::{DiffFile, DiffFileStatus, DiffLinePosition, DiffLineRange, DiffSide};
 pub use parser::{DiffParseError, DiffParseOptions};
 pub use presentation::DiffInlineUnit;
-pub use state::{DiffEvent, DiffScrollAnchor, DiffState};
+pub use state::{DiffEvent, DiffFoldMemory, DiffScrollAnchor, DiffState};
 
 use std::{collections::HashMap, rc::Rc, sync::Arc};
 
@@ -39,6 +39,7 @@ use crate::{
     h_flex,
     input::{Copy, SelectAll},
     scroll::{ScrollableMask, Scrollbar},
+    tooltip::{ManagedTooltipExt as _, Tooltip},
     v_flex,
 };
 use actions::*;
@@ -544,15 +545,22 @@ fn render_diff(
     let rem = window.rem_size();
     let font_size = rem * (f32::from(cx.theme().mono_font_size) / 16.);
     let font_family = cx.theme().mono_font_family.clone();
-    let row_height = font_size * 1.6;
     let digits = state
         .files()
         .iter()
         .map(|file| file.line_number_digits())
         .max()
         .unwrap_or(1);
+    let row_height = font_size * 1.6;
+    // Nested folds keep a lane before the line numbers for the anchor that
+    // folds an expanded level again.
+    let fold_lane = if props.line_number && state.nested_folds() {
+        row_height
+    } else {
+        px(0.)
+    };
     let gutter_width = if props.line_number {
-        font_size * 0.7 * digits as f32 + rem
+        font_size * 0.7 * digits as f32 + rem + fold_lane
     } else {
         px(0.)
     };
@@ -624,6 +632,7 @@ fn render_diff(
         rem,
         expansion_lines: state.expansion_lines(),
         nested_folds: state.nested_folds(),
+        fold_lane,
         line_number: props.line_number,
         syntax_highlight: props.syntax_highlight,
         header_visible: props.header_visible,
@@ -901,6 +910,9 @@ struct CodePresentation {
     rem: Pixels,
     expansion_lines: usize,
     nested_folds: bool,
+    /// Width of the anchor lane in each line-number column; zero without
+    /// nested folds.
+    fold_lane: Pixels,
     line_number: bool,
     syntax_highlight: bool,
     header_visible: bool,
@@ -1233,10 +1245,11 @@ fn render_wave_fold(
     } else {
         cx.theme().border
     };
-    let column = |id: &'static str, width: Option<Pixels>| {
+    let column = |id: &'static str, width: Option<Pixels>, side: Option<DiffSide>| {
         let hover = code.state.clone();
         let click = code.state.clone();
         let pairs = pairs.clone();
+        let preview_pairs = pairs.clone();
         div()
             .id((id, pairs.start))
             .test_support()
@@ -1262,7 +1275,15 @@ fn render_wave_fold(
                     state.expand_fold(file, pairs.clone(), FoldExpansion::All, cx)
                 })
             })
-            .child(wave(color))
+            .child(
+                // The hidden lines show after a pause; the column itself
+                // tracks the hover that highlights the whole row.
+                div()
+                    .id(("fold-preview", fold.1))
+                    .size_full()
+                    .managed_tooltip(fold_preview(file, preview_pairs, side, code))
+                    .child(wave(color)),
+            )
     };
     if code.mode == DiffMode::Split && code.single_column_side(file).is_none() {
         h_flex()
@@ -1270,7 +1291,11 @@ fn render_wave_fold(
             .when(code.split_scroll, |this| {
                 this.child(div().w(code.split_shift).flex_shrink_0())
             })
-            .child(column("fold-old", Some(code.column_width)))
+            .child(column(
+                "fold-old",
+                Some(code.column_width),
+                Some(DiffSide::Original),
+            ))
             .when(code.divider_marker_content.is_some(), |this| {
                 this.child(
                     div()
@@ -1286,10 +1311,98 @@ fn render_wave_fold(
                         .child(wave(color)),
                 )
             })
-            .child(column("fold-new", Some(code.column_width)))
+            .child(column(
+                "fold-new",
+                Some(code.column_width),
+                Some(DiffSide::Modified),
+            ))
             .into_any_element()
     } else {
-        column("fold", None).into_any_element()
+        let side = code.single_column_side(file);
+        column("fold", None, side).into_any_element()
+    }
+}
+
+/// Builds the preview of the lines a nested fold hides: line numbers and
+/// text of `side`, or of both sides in a unified column.
+fn fold_preview(
+    file: usize,
+    pairs: std::ops::Range<usize>,
+    side: Option<DiffSide>,
+    code: &CodePresentation,
+) -> impl Fn(&mut Window, &mut App) -> gpui::AnyView + 'static {
+    let document = code.files[file].clone();
+    let font_size = code.font_size;
+    let row_height = code.row_height;
+    move |window, cx| {
+        // Only as many lines as fit in half the window are drawn.
+        let max_height = window.viewport_size().height / 2.;
+        let count = ((max_height / row_height).ceil() as usize).max(1);
+        let sides: &[DiffSide] = match side {
+            Some(DiffSide::Original) => &[DiffSide::Original],
+            Some(DiffSide::Modified) => &[DiffSide::Modified],
+            None => &[DiffSide::Original, DiffSide::Modified],
+        };
+        let text_side = side.unwrap_or(DiffSide::Modified);
+        let index = |pair: &document::LinePair, side: DiffSide| match side {
+            DiffSide::Original => pair.original(),
+            DiffSide::Modified => pair.modified(),
+        };
+        let lines = document.pairs()[pairs.clone()]
+            .iter()
+            .take(count)
+            .map(|pair| {
+                let numbers = sides
+                    .iter()
+                    .map(|side| {
+                        index(pair, *side).map(|ix| {
+                            SharedString::from(document.line_number(*side, ix).to_string())
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                let text = index(pair, text_side)
+                    .map(|ix| document.lines(text_side)[ix].display().clone());
+                let line = index(pair, text_side).map(|ix| document.line_number(text_side, ix));
+                (numbers, text, line)
+            })
+            .collect::<Vec<_>>();
+        let font_family = cx.theme().mono_font_family.clone();
+        Tooltip::element(move |_, cx| {
+            let muted = cx.theme().muted_foreground;
+            v_flex()
+                .max_h(max_height)
+                .overflow_hidden()
+                .font_family(font_family.clone())
+                .text_size(font_size)
+                .line_height(row_height)
+                .children(lines.iter().map(|(numbers, text, line)| {
+                    #[cfg(not(test))]
+                    let _ = line;
+                    h_flex()
+                        .map(|this| {
+                            #[cfg(test)]
+                            let this = {
+                                let line = *line;
+                                this.debug_selector(move || {
+                                    format!("fold-preview-line-{}", line.unwrap_or_default())
+                                })
+                            };
+                            this
+                        })
+                        .h(row_height)
+                        .flex_shrink_0()
+                        .gap_3()
+                        .whitespace_nowrap()
+                        .children(numbers.iter().map(|number| {
+                            div()
+                                .flex_shrink_0()
+                                .text_color(muted)
+                                .children(number.clone())
+                        }))
+                        .children(text.clone())
+                }))
+        })
+        .build(window, cx)
     }
 }
 
@@ -1672,7 +1785,26 @@ fn render_gutter(
         code.hover_highlight,
         DiffHoverHighlight::LineNumber | DiffHoverHighlight::Both
     );
-    div()
+    // Nested fold anchors: the anchor of an expanded level shows on its first
+    // row while the pointer is over the column's line numbers; a unified
+    // row's two number columns count as one, with the anchor on the right.
+    let anchors = code.fold_lane > px(0.);
+    let unified = code.mode == DiffMode::Unified || code.single_column_side(file).is_some();
+    let anchor_side = if unified { DiffSide::Modified } else { side };
+    let anchor = ix
+        .filter(|_| anchors && side == anchor_side)
+        .and_then(|ix| code.state.read(cx).fold_anchor(file, side, ix))
+        .filter(|_| {
+            code.state
+                .read(cx)
+                .hovered_gutter()
+                .is_some_and(|(hovered, hovered_side, _)| {
+                    hovered == file && (unified || hovered_side == side)
+                })
+        });
+    let gutter = (file, side, ix.unwrap_or(usize::MAX));
+    let hovered = code.state.clone();
+    h_flex()
         .id(if side == DiffSide::Original {
             "old-gutter"
         } else {
@@ -1683,6 +1815,42 @@ fn render_gutter(
         .pr_1()
         .when(hover, |this| {
             this.hover(|this| this.bg(cx.theme().list_hover))
+        })
+        .when(anchors, |this| {
+            this.on_hover(move |entered, _, cx| {
+                hovered.update(cx, |state, cx| state.hover_gutter(gutter, *entered, cx))
+            })
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .size(code.fold_lane)
+                    .when_some(anchor, |this, level| {
+                        let state = code.state.clone();
+                        let start = level.start;
+                        this.child(
+                            Button::new(("fold-anchor", start))
+                                .ghost()
+                                .xsmall()
+                                .size(code.fold_lane)
+                                .icon(IconName::ChevronDown)
+                                .text_color(cx.theme().muted_foreground)
+                                .accessibility_label(t!("Diff.CollapseUnchangedLines").to_string())
+                                .map(|this| {
+                                    #[cfg(test)]
+                                    let this =
+                                        this.debug_selector(move || format!("fold-anchor-{start}"));
+                                    this
+                                })
+                                // Keep the press from starting a line selection.
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .on_click(move |_, _, cx| {
+                                    state.update(cx, |state, cx| {
+                                        state.collapse_fold(file, level.clone(), cx)
+                                    })
+                                }),
+                        )
+                    }),
+            )
         })
         .when_some(ix, |this, ix| {
             let position = code.position(file, side, ix);
@@ -1707,7 +1875,8 @@ fn render_gutter(
                         });
                         this
                     })
-                    .w_full()
+                    .flex_1()
+                    .min_w_0()
                     .h(code.row_height)
                     .px_1()
                     .flex()

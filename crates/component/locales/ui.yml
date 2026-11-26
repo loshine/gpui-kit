@@ -840,6 +840,12 @@ Diff:
     ru: "Развернуть неизменённые строки"
     zh-CN: 展开未变更内容
     zh-HK: 展開未變更內容
+  CollapseUnchangedLines:
+    en: Collapse unchanged lines
+    pt-BR: "Recolher linhas sem mudança"
+    ru: "Свернуть неизменённые строки"
+    zh-CN: 折叠未变更内容
+    zh-HK: 摺疊未變更內容
   SourceLine:
     en: "%{side} line %{line}"
     pt-BR: "%{side} linha %{line}"
