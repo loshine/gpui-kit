@@ -176,7 +176,12 @@ impl SelectedLines {
             Self::Patch {
                 file: selected,
                 patch,
-            } => *selected == file && patch.contains(&files[file].patch_ix(side, ix)),
+            } => {
+                *selected == file
+                    && files[file]
+                        .patch_ix(side, ix)
+                        .is_some_and(|ix| patch.contains(&ix))
+            }
         }
     }
 
@@ -201,7 +206,12 @@ impl SelectedLines {
             Self::Patch {
                 file: selected,
                 patch,
-            } => *selected == file && files[file].patch_ix(side, ix) + 1 == patch.end,
+            } => {
+                *selected == file
+                    && files[file]
+                        .patch_ix(side, ix)
+                        .is_some_and(|ix| ix + 1 == patch.end)
+            }
         }
     }
 }
@@ -1262,14 +1272,17 @@ impl DiffState {
             });
         }
         let document = &self.files[file];
-        let start = document.patch_ix(
-            range.side(),
-            document.line_index(range.side(), range.start())?,
-        );
-        let end = document.patch_ix(
-            range.end_side(),
-            document.line_index(range.end_side(), range.end())?,
-        );
+        // A trailing empty line is not in the patch; it stands at the patch's end.
+        let patch_ix = |side, line| {
+            let ix = document.line_index(side, line)?;
+            Some(
+                document
+                    .patch_ix(side, ix)
+                    .unwrap_or_else(|| document.patch_lines().len().saturating_sub(1)),
+            )
+        };
+        let start = patch_ix(range.side(), range.start())?;
+        let end = patch_ix(range.end_side(), range.end())?;
         Some(SelectedLines::Patch {
             file,
             patch: start.min(end)..start.max(end) + 1,

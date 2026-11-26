@@ -119,7 +119,7 @@ impl DiffLineRange {
 }
 
 /// One supplied source line and its display form.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct SourceLine {
     line_number: usize,
     text: SharedString,
@@ -133,13 +133,13 @@ pub(crate) struct SourceLine {
     content_end: usize,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct DisplayChunk {
     range: Range<usize>,
     text: SharedString,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct DisplayTab {
     source_offset: usize,
     display_offset: usize,
@@ -310,7 +310,7 @@ impl Hunk {
 
 /// One side of a file: its path, unless the side is missing such as
 /// `/dev/null`, and the source fragments the patch supplies.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct FileSide {
     path: Option<SharedString>,
     source: SharedString,
@@ -369,6 +369,7 @@ impl PatchLine {
     }
 }
 
+#[derive(Clone)]
 struct DocumentInner {
     path: SharedString,
     status: DiffFileStatus,
@@ -475,6 +476,92 @@ impl DiffFile {
         self.language = Some(language.into());
         self
     }
+    /// Shows each of `sides` as a whole document, the way an editor does: a
+    /// side whose source is empty or ends with a line break gets one more,
+    /// empty line after its last line, numbered one past it.
+    ///
+    /// Only the caller knows whether the patch supplies a side up to its end,
+    /// such as a patch with the whole file as context, and whether a side the
+    /// patch does not name, such as an index entry added with intent to add,
+    /// is an empty document. Call this only for such sides; the patch's other
+    /// lines are kept as supplied.
+    ///
+    /// A trailing line on both sides is one unchanged row. A trailing line on
+    /// only one side is marked as added or removed. A whole-file reference
+    /// ([`DiffFile::unchanged`]) has only its modified side, so its trailing
+    /// line is unchanged and the original side is ignored; conflicted and
+    /// binary files are returned as they are. When the last line
+    /// of one side has no line break and the line paired with it differs only
+    /// by its line break, that pair is no longer marked changed, since only the
+    /// trailing line differs. Trailing lines join the last hunk, so context and
+    /// folding treat them as the file's last lines; they are not patch lines,
+    /// and change counts stay as the patch reports them.
+    pub fn with_trailing_lines(mut self, sides: impl IntoIterator<Item = DiffSide>) -> Self {
+        if self.inner.binary || self.status() == DiffFileStatus::Conflicted {
+            return self;
+        }
+        let reference = self.status() == DiffFileStatus::Unchanged;
+        let inner = Arc::make_mut(&mut self.inner);
+        let mut trailing = [None; 2];
+        let mut requested = false;
+        for side in sides {
+            if reference && side == DiffSide::Original {
+                continue;
+            }
+            requested = true;
+            let file_side = match side {
+                DiffSide::Original => &mut inner.original,
+                DiffSide::Modified => &mut inner.modified,
+            };
+            if trailing[side as usize].is_some()
+                || !(file_side.source.is_empty() || file_side.source.ends_with('\n'))
+            {
+                continue;
+            }
+            let end = file_side.source.len();
+            let line_number = file_side
+                .lines
+                .last()
+                .map_or(1, |line| line.line_number + 1);
+            file_side
+                .lines
+                .push(source_line(&file_side.source, end..end, line_number));
+            trailing[side as usize] = Some(file_side.lines.len() - 1);
+        }
+        if requested {
+            unmark_final_line_break(inner);
+        }
+        let [original, modified] = trailing;
+        if original.is_none() && modified.is_none() {
+            return self;
+        }
+        let changed = original.is_none() != modified.is_none() && !reference;
+        if let (Some(old), Some(new)) = (original, modified) {
+            inner.original.lines[old].counterpart = Some(new);
+            inner.modified.lines[new].counterpart = Some(old);
+        }
+        inner.pairs.push(LinePair::new(original, modified, changed));
+        let pair = inner.pairs.len() - 1;
+        if let Some(hunk) = inner.hunks.last_mut() {
+            hunk.pairs.end = pair + 1;
+            if let Some(old) = original {
+                hunk.original.end = old + 1;
+                hunk.original_lines.end += 1;
+            }
+            if let Some(new) = modified {
+                hunk.modified.end = new + 1;
+            }
+        }
+        let widest = [&inner.original, &inner.modified]
+            .iter()
+            .filter_map(|side| side.lines.last())
+            .map(|line| line.line_number)
+            .max()
+            .unwrap_or(1);
+        inner.line_number_digits = widest.max(1).ilog10() as usize + 1;
+        self
+    }
+
     /// The syntax language: the override, or the one detected from the path.
     pub fn language(&self) -> SharedString {
         self.language
@@ -617,9 +704,10 @@ impl DiffFile {
     pub(crate) fn patch_lines(&self) -> &[PatchLine] {
         &self.inner.patch_lines
     }
-    /// The position of a side's line in [`Self::patch_lines`].
-    pub(crate) fn patch_ix(&self, side: DiffSide, ix: usize) -> usize {
-        self.inner.patch_ixs[side as usize][ix]
+    /// The position of a side's line in [`Self::patch_lines`], or `None` for
+    /// a trailing empty line, which the patch does not contain.
+    pub(crate) fn patch_ix(&self, side: DiffSide, ix: usize) -> Option<usize> {
+        self.inner.patch_ixs[side as usize].get(ix).copied()
     }
 
     pub(crate) fn side_path(&self, side: DiffSide) -> Option<&SharedString> {
@@ -637,6 +725,45 @@ impl DiffFile {
     }
     pub(crate) fn source(&self, side: DiffSide) -> &str {
         &self.side(side).source
+    }
+}
+
+/// Unmarks the changed pair whose lines differ only because one of them is
+/// its side's last line and has no line break, as an editor compares lines
+/// without their breaks. See [`DiffFile::with_trailing_lines`].
+fn unmark_final_line_break(inner: &mut DocumentInner) {
+    for side in [DiffSide::Original, DiffSide::Modified] {
+        let (this, other) = match side {
+            DiffSide::Original => (&inner.original, &inner.modified),
+            DiffSide::Modified => (&inner.modified, &inner.original),
+        };
+        let Some(last) = this.lines.last() else {
+            continue;
+        };
+        if last.source.end != this.source.len() || this.source.ends_with('\n') {
+            continue;
+        }
+        let ix = this.lines.len() - 1;
+        let Some(pair) = inner.pairs.iter_mut().find(|pair| {
+            pair.changed
+                && match side {
+                    DiffSide::Original => pair.original == Some(ix),
+                    DiffSide::Modified => pair.modified == Some(ix),
+                }
+        }) else {
+            continue;
+        };
+        let counterpart = match side {
+            DiffSide::Original => pair.modified,
+            DiffSide::Modified => pair.original,
+        };
+        if counterpart.is_some_and(|counterpart| {
+            let line = &other.lines[counterpart];
+            line.text == last.text
+                && other.source[line.content_end..line.source.end].ends_with('\n')
+        }) {
+            pair.changed = false;
+        }
     }
 }
 

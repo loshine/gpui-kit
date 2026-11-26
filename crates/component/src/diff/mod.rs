@@ -2343,3 +2343,5 @@ mod selection_tests;
 mod split_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod trailing_line_tests;
