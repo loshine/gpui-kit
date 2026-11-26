@@ -89,6 +89,25 @@ impl SelectionGeometry {
         let ix =
             run.display_range.start + run.layout.index_for_position(point).unwrap_or_else(|ix| ix);
         let line = &run.document.lines(run.side)[run.line_ix];
+        // A boxed abbreviation is one character: its left half lands before
+        // it and its right half after it.
+        let ix = line
+            .special_ranges(ix..ix + 1)
+            .next()
+            .and_then(|special| {
+                let x = |ix: usize| {
+                    run.layout
+                        .position_for_index(ix - run.display_range.start)
+                        .map(|position| position.x)
+                };
+                let middle = (x(special.start)? + x(special.end)?) / 2.;
+                Some(if point.x < middle {
+                    special.start
+                } else {
+                    special.end
+                })
+            })
+            .unwrap_or(ix);
         Some(encode_key(
             run.file,
             run.side,

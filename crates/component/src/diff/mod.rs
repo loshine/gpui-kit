@@ -29,6 +29,8 @@ use gpui::{
     prelude::FluentBuilder as _, px,
 };
 use gpui_base::TestSupportExt as _;
+#[cfg(feature = "test-support")]
+use gpui_base::TestTextExt as _;
 use rust_i18n::t;
 
 use crate::{
@@ -2087,7 +2089,9 @@ fn code_line(
             }
         })
         .children(ranges.into_iter().enumerate().map(|(chunk_ix, range)| {
-            CodeText::new(
+            #[cfg(feature = "test-support")]
+            let painted = source_line.display()[range.clone()].to_string();
+            let text = CodeText::new(
                 ("code", chunk_ix).into(),
                 document.clone(),
                 file,
@@ -2097,7 +2101,12 @@ fn code_line(
                 highlights.clone(),
                 code.selection.clone(),
                 code.geometry.clone(),
-            )
+            );
+            // UI tests read the text as painted: tabs expanded, special
+            // characters as their abbreviations.
+            #[cfg(feature = "test-support")]
+            let text = text.test_text(painted);
+            text
         }));
     let gutters_width = if code.line_number {
         code.gutter_width * gutters.iter().flatten().count() as f32
