@@ -1,12 +1,33 @@
 use gpui::{
-    AnyElement, App, ElementId, IntoElement, ParentElement, RenderOnce, SharedString,
-    StyleRefinement, Styled, Window, div, prelude::FluentBuilder as _,
+    AnyElement, App, ElementId, IntoElement, ParentElement, Rems, RenderOnce, SharedString,
+    StyleRefinement, Styled, Window, div, prelude::FluentBuilder as _, rems,
 };
 use smallvec::SmallVec;
 
 use gpui_base::{Toolbar as BaseToolbar, ToolbarGroup as BaseToolbarGroup};
 
 use crate::{Sizable, Size, StyleSized as _, StyledExt as _};
+
+mod overflow;
+
+pub(crate) fn init(cx: &mut gpui::App) {
+    overflow::init(cx);
+}
+
+pub use overflow::{ToolbarOverflow, ToolbarOverflowOpener, ToolbarOverflowRow};
+
+/// The space between a toolbar's items at `size`.
+fn toolbar_gap(size: Size) -> Rems {
+    match size {
+        Size::XSmall | Size::Small => rems(0.25),
+        _ => rems(0.5),
+    }
+}
+
+/// The padding around a toolbar's items at `size`.
+fn toolbar_padding(size: Size) -> Rems {
+    toolbar_gap(size)
+}
 
 enum ToolbarItem {
     Sized(Box<dyn FnOnce(Size) -> AnyElement>),
@@ -249,10 +270,12 @@ impl RenderOnce for Toolbar {
             .flex()
             .items_center()
             .flex_shrink_0()
+            .p(toolbar_padding(size))
+            .gap(toolbar_gap(size))
             .map(|this| match size {
-                Size::XSmall => this.min_h_7().p_1().gap_1().text_xs(),
-                Size::Small => this.min_h_8().p_1().gap_1().text_sm(),
-                _ => this.min_h_12().p_2().gap_2().text_sm(),
+                Size::XSmall => this.min_h_7().text_xs(),
+                Size::Small => this.min_h_8().text_sm(),
+                _ => this.min_h_12().text_sm(),
             })
             .refine_style(&self.style)
             .children(items)

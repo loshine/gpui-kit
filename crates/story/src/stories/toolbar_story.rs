@@ -8,12 +8,12 @@ use gpui_kit::component::{
     searchable_list::SearchableVec,
     select::{Select, SelectState},
     separator::Separator,
-    toolbar::{Toolbar, ToolbarGroup},
+    toolbar::{Toolbar, ToolbarGroup, ToolbarOverflow, ToolbarOverflowRow},
     v_flex,
 };
 use gpui_kit::{
     Action, App, AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement,
-    IntoElement, ParentElement, Render, Styled, Window, div, px,
+    IntoElement, ParentElement, Render, Styled, Window, div, prelude::FluentBuilder as _, px,
 };
 use serde::Deserialize;
 
@@ -32,6 +32,7 @@ pub struct ToolbarStory {
     market: Entity<SelectState<Vec<&'static str>>>,
     status: Entity<ComboboxState<SearchableVec<&'static str>>>,
     query: Entity<InputState>,
+    overflow: Entity<ToolbarOverflow>,
 }
 
 impl ToolbarStory {
@@ -62,6 +63,7 @@ impl ToolbarStory {
             .searchable(true)
         });
         let query = cx.new(|cx| InputState::new(window, cx).placeholder("Search"));
+        let overflow = cx.new(|cx| ToolbarOverflow::new(window, cx));
 
         Self {
             focus_handle: cx.focus_handle(),
@@ -72,6 +74,7 @@ impl ToolbarStory {
             market,
             status,
             query,
+            overflow,
         }
     }
 
@@ -85,6 +88,23 @@ fn icon_button(id: &'static str, icon: IconName, tooltip: &'static str, disabled
         .icon(icon)
         .tooltip(tooltip)
         .disabled(disabled)
+}
+
+/// The commands of the overflow example, built once for the row and again
+/// for its open panel.
+fn overflow_commands(disabled: bool) -> Vec<Button> {
+    vec![
+        icon_button("overflow-new", IconName::Plus, "New", disabled),
+        Button::new("overflow-save")
+            .icon(AssetIconName::Save)
+            .tooltip("Save")
+            .disabled(disabled),
+        icon_button("overflow-undo", IconName::Undo2, "Undo", disabled),
+        icon_button("overflow-redo", IconName::Redo2, "Redo", disabled),
+        icon_button("overflow-copy", IconName::Copy, "Copy", disabled),
+        icon_button("overflow-search", IconName::Search, "Find", disabled),
+        icon_button("overflow-refresh", IconName::RotateCw, "Refresh", disabled),
+    ]
 }
 
 fn toolbar_options(size: Size, disabled: bool) -> impl IntoElement {
@@ -294,5 +314,38 @@ impl Render for ToolbarStory {
                             )),
                     ),
             )
+            .child({
+                let open = self.overflow.read(cx).is_open();
+                section("Overflow")
+                    .description("Commands that do not fit are hidden from the end. Rest the pointer on › to show them all.")
+                    .w(px(240.))
+                    .child(
+                        Toolbar::new("overflow-toolbar")
+                            .w_full()
+                            .with_size(self.size)
+                            .disabled(self.disabled)
+                            .border_1()
+                            .border_color(cx.theme().border)
+                            .rounded(cx.theme().radius)
+                            .content(
+                                ToolbarOverflowRow::new("overflow-row", &self.overflow)
+                                    .with_size(self.size)
+                                    .children(overflow_commands(self.disabled))
+                                    .when(open, |row| {
+                                        row.panel(
+                                            Toolbar::new("overflow-panel")
+                                                .disabled(self.disabled)
+                                                .children(overflow_commands(self.disabled)),
+                                        )
+                                    }),
+                            )
+                            .content(
+                                div()
+                                    .flex_none()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child("Saved"),
+                            ),
+                    )
+            })
     }
 }

@@ -147,6 +147,7 @@ pub fn init(cx: &mut App) {
     questionnaire::init(cx);
     menu::init(cx);
     table::init(cx);
+    toolbar::init(cx);
     tooltip::init(cx);
 }
 
